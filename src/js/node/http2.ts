@@ -3760,22 +3760,20 @@ const kForbiddenConnectionHeaders = new SafeSet([
   "proxy-connection",
   "transfer-encoding",
 ]);
-// RFC 9113 §8.2.2, checked the way node's mapToHeaders does: before anything is encoded, an
-// undefined value is not a field, a one-element array is its element, and `te` is legal only
-// as `te: trailers`.
+// RFC 9113 §8.2.2 with node's mapToHeaders field rules. Only a `te` value is read, so a user
+// toString() runs once, in the native walk.
 function assertNoConnectionHeaders(headers): void {
   const keys = ObjectKeys(headers);
   for (let i = 0; i < keys.length; i++) {
     let value = headers[keys[i]];
-    if (value === undefined) continue;
-    if ($isArray(value)) {
-      if (value.length === 0) continue;
-      if (value.length === 1) value = `${value[0]}`;
-    } else {
-      value = `${value}`;
-    }
+    if (value === undefined || ($isArray(value) && value.length === 0)) continue;
     const lower = keys[i].toLowerCase();
-    if (kForbiddenConnectionHeaders.has(lower) || (lower === "te" && value !== "trailers")) {
+    let forbidden = kForbiddenConnectionHeaders.has(lower);
+    if (!forbidden && lower === "te") {
+      if ($isArray(value) && value.length === 1) value = value[0];
+      forbidden = `${value}` !== "trailers";
+    }
+    if (forbidden) {
       throw $ERR_HTTP2_INVALID_CONNECTION_HEADERS(`HTTP/1 Connection specific headers are forbidden: "${lower}"`);
     }
   }
