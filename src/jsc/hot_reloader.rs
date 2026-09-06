@@ -1070,6 +1070,84 @@ where
                             strings::paths::without_trailing_slash_windows_path(file_path),
                         );
 
+                        // A directory below this one may have been replaced: renamed over
+                        // (`mv lib lib.old && mv lib.new lib`), or removed and created
+                        // again. Every watch at or below it is on the old inode, so no
+                        // later save under it would fire, and each reload's `add_file`
+                        // would keep matching the stale entries by hash. Evict that
+                        // subtree and reload what was loaded from it. inotify names the
+                        // created or moved-in entry; kqueue only reports the write, so
+                        // there the watcher compares inodes.
+                        {
+                            let mut stale_dirs: Vec<Box<[u8]>> = Vec::new();
+                            let mut stale_files: usize = 0;
+                            let mut on_stale = |kind: bun_watcher::Kind,
+                                                path: &[u8],
+                                                hash: bun_watcher::HashType| {
+                                match kind {
+                                    bun_watcher::Kind::File => {
+                                        record_changed_path(path);
+                                        current_task.append(hash);
+                                        stale_files += 1;
+                                    }
+                                    bun_watcher::Kind::Directory => {
+                                        stale_dirs.push(Box::from(strings::trim_right(path, &[SEP])));
+                                    }
+                                }
+                            };
+                            if IS_KQUEUE {
+                                if event.op.contains(WatchOp::WRITE) {
+                                    // SAFETY: see the File-arm `remove_at_index` call
+                                    // above; this only queues evictions.
+                                    unsafe {
+                                        (*ctx).remove_replaced_descendants(event.index, &mut on_stale)
+                                    };
+                                }
+                            } else if event.op.intersects(WatchOp::CREATE | WatchOp::MOVE_TO) {
+                                let dir = strings::trim_right(file_path, &[SEP]);
+                                let mut child_buf = bun_paths::path_buffer_pool::get();
+                                // The resolver may cache a replaced directory itself even
+                                // when only paths below it are watched.
+                                let mut replaced: Vec<Box<[u8]>> = Vec::new();
+                                for name in affected_inotify.iter().flatten() {
+                                    let name = name.as_bytes();
+                                    let child_len = dir.len() + 1 + name.len();
+                                    if name.is_empty() || child_len > child_buf.len() {
+                                        continue;
+                                    }
+                                    child_buf[..dir.len()].copy_from_slice(dir);
+                                    child_buf[dir.len()] = SEP;
+                                    child_buf[dir.len() + 1..child_len].copy_from_slice(name);
+                                    let child = &child_buf[..child_len];
+                                    // SAFETY: as above.
+                                    let evicted = unsafe {
+                                        (*ctx).remove_path_and_descendants(child, &mut on_stale)
+                                    };
+                                    if evicted > 0 {
+                                        replaced.push(Box::from(child));
+                                    }
+                                }
+                                stale_dirs.extend(replaced);
+                            }
+                            for dir in &stale_dirs {
+                                let _ = self.ctx_mut().bust_dir_cache(dir);
+                                if self.verbose {
+                                    Self::debug(format_args!(
+                                        "Dir replaced: {}",
+                                        bstr::BStr::new(bun_paths::resolve_path::relative(
+                                            fs.top_level_dir,
+                                            dir,
+                                        ))
+                                    ));
+                                }
+                            }
+                            if !stale_dirs.is_empty() && stale_files == 0 {
+                                // The modules under it were evicted when they disappeared;
+                                // reload so that they resolve under the new directory.
+                                current_task.append(current_hash);
+                            }
+                        }
+
                         // The watched entrypoint has a per-file inotify watch on its inode.
                         // An atomic rename (`rename(tmp, entrypoint)`) or a rm+recreate over
                         // the entrypoint replaces that inode, so the kernel drops the
