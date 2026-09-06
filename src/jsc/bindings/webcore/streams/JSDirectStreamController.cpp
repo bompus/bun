@@ -909,7 +909,7 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundDirectEnd, (JSGlobalObject * g
     auto* controller = dynamicDowncast<JSDirectStreamController>(callFrame->argument(0));
     if (!controller || controller->m_closed) [[unlikely]]
         return JSValue::encode(jsUndefined());
-    return closeDirectControllerFromJS(vm, globalObject, controller, callFrame->argument(1));
+    return closeDirectControllerFromJS(vm, globalObject, controller, jsUndefined());
 }
 
 // controller.close(reason) with a truthy reason is the source's failure: the same as error(reason).

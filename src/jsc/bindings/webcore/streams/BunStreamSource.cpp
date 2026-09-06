@@ -871,7 +871,7 @@ JSValue readDirectStream(JSGlobalObject* globalObject, JSReadableStream* stream,
 
     if (auto* pullPromise = dynamicDowncast<JSPromise>(maybePromise)) {
         auto* result = JSPromise::create(vm, globalObject->promiseStructure());
-        pullPromise->performPromiseThenWithContext(vm, globalObject, runtime->onReadDirectStreamPullFulfilled(), jsUndefined(), result, state);
+        pullPromise->performPromiseThenWithContext(vm, globalObject, runtime->onReadDirectStreamPullFulfilled(), runtime->onReadDirectStreamPullRejected(), result, state);
         return result;
     }
     if (stream->m_state == ReadableStreamState::Readable) {
@@ -1355,7 +1355,8 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_onNativeSourceCallCloseMicrotask, (
     return JSValue::encode(jsUndefined());
 }
 
-// readDirectStream's pull() promise fulfilled: a close(reason) that ran meanwhile rejects the pump.
+// readDirectStream's pull() promise settled. A close(reason) that ran meanwhile already errored the
+// stream with that reason, so the pump rejects with it; otherwise the pump follows pull()'s promise.
 JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_onReadDirectStreamPullFulfilled, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
     auto& vm = getVM(globalObject);
@@ -1366,6 +1367,16 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_onReadDirectStreamPullFulfilled, (J
         return {};
     }
     return JSValue::encode(jsUndefined());
+}
+
+JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_onReadDirectStreamPullRejected, (JSGlobalObject * globalObject, CallFrame* callFrame))
+{
+    auto& vm = getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    auto* state = uncheckedDowncast<JSDirectSinkCloseState>(callFrame->argument(1));
+    JSValue closeReason = state->m_closeReason.get();
+    throwException(globalObject, scope, closeReason ? closeReason : callFrame->argument(0));
+    return {};
 }
 
 JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_onReadStreamIntoSinkReadManyFulfilled, (JSGlobalObject * globalObject, CallFrame* callFrame))

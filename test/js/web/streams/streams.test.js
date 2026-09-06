@@ -631,6 +631,17 @@ describe("ReadableStream (direct): controller.close(error) fails the consumer", 
           await Bun.sleep(1);
         },
       }),
+    // close(error) errored the stream first: a later pull() rejection does not replace it.
+    "async-close-then-throw": () =>
+      new ReadableStream({
+        type: "direct",
+        async pull(c) {
+          c.write("abc");
+          c.close(boom());
+          await Bun.sleep(1);
+          throw new Error("pull failed after close");
+        },
+      }),
   };
   const consumers = {
     "Response.text()": stream => new Response(stream).text(),
