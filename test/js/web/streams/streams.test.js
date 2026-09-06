@@ -590,7 +590,13 @@ it.each(["text", "bytes", "arrayBuffer"])(
           throw new Error("close hook threw");
         },
       });
-      await expect(new Response(stream)[method]()).rejects.toThrow("close hook threw");
+      // Awaited directly (not through expect().rejects) so a body that never settles is a plain
+      // test timeout.
+      const settled = await new Response(stream)[method]().then(
+        () => "resolved",
+        error => `rejected: ${error?.message}`,
+      );
+      expect(settled).toBe("rejected: close hook threw");
     }
   },
 );
