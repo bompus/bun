@@ -892,9 +892,27 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundDirectWrite, (JSGlobalObject *
     return JSValue::encode(wrote);
 }
 
-// controller.close(): if closing fails part-way (the sink's end(), the source's close() hook),
-// the stream cannot complete normally — it is errored with that failure (so a pending read
-// settles) and the failure is still thrown to the caller of close().
+// controller.end() / a clean controller.close(): if closing fails part-way (the sink's end(), the
+// source's close() hook), the stream cannot complete normally — it is errored with that failure
+// (so a pending read settles) and the failure is still thrown to the caller.
+static JSC::EncodedJSValue closeDirectControllerFromJS(JSC::VM& vm, JSGlobalObject* globalObject, JSDirectStreamController* controller, JSValue reason)
+{
+    return enterStreams(globalObject, [&] { controller->onClose(globalObject, reason); }, [&](JSValue error) {
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        controller->handleError(globalObject, error);
+        RETURN_IF_EXCEPTION(scope, );
+        throwException(globalObject, scope, error); });
+}
+
+JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundDirectEnd, (JSGlobalObject * globalObject, CallFrame* callFrame))
+{
+    auto& vm = getVM(globalObject);
+    auto* controller = dynamicDowncast<JSDirectStreamController>(callFrame->argument(0));
+    if (!controller || controller->m_closed) [[unlikely]]
+        return JSValue::encode(jsUndefined());
+    return closeDirectControllerFromJS(vm, globalObject, controller, callFrame->argument(1));
+}
+
 // controller.close(reason) with a truthy reason is the source's failure: the same as error(reason).
 JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundDirectClose, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
@@ -909,11 +927,7 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundDirectClose, (JSGlobalObject *
         RETURN_IF_EXCEPTION(scope, {});
         return JSValue::encode(jsUndefined());
     }
-    return enterStreams(globalObject, [&] { controller->onClose(globalObject, reason); }, [&](JSValue error) {
-        auto scope = DECLARE_THROW_SCOPE(vm);
-        controller->handleError(globalObject, error);
-        RETURN_IF_EXCEPTION(scope, );
-        throwException(globalObject, scope, error); });
+    return closeDirectControllerFromJS(vm, globalObject, controller, reason);
 }
 
 JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundDirectFlush, (JSGlobalObject * globalObject, CallFrame* callFrame))
@@ -953,7 +967,7 @@ static void installDirectControllerMethods(JSC::VM& vm, JSGlobalObject* globalOb
     };
     const Method methods[] = {
         { names.writePublicName(), runtime->boundDirectWrite(), 1 },
-        { names.endPublicName(), runtime->boundDirectClose(), 0 },
+        { names.endPublicName(), runtime->boundDirectEnd(), 0 },
         { names.closePublicName(), runtime->boundDirectClose(), 1 },
         { names.flushPublicName(), runtime->boundDirectFlush(), 0 },
         { vm.propertyNames->error, runtime->boundDirectError(), 1 },

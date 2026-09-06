@@ -674,6 +674,9 @@ describe("ReadableStream (direct): controller.close(error) fails the consumer", 
     ["close(null)", c => c.close(null)],
     ["close(false)", c => c.close(false)],
     ['close("")', c => c.close("")],
+    ["end()", c => c.end()],
+    // end() takes no reason: a stray argument (`promise.then(c.end)`) is not an error.
+    ["end(new Error())", c => c.end(new Error("not a failure"))],
   ])("%s is a clean close", async (_, close) => {
     const mk = () =>
       new ReadableStream({
@@ -683,6 +686,7 @@ describe("ReadableStream (direct): controller.close(error) fails the consumer", 
           close(c);
         },
       });
+    // One consumer per controller kind: reader based, one-shot buffer, native sink.
     expect(await new Response(mk()).text()).toBe("abc");
     expect(await new Response(mk()).bytes()).toEqual(new TextEncoder().encode("abc"));
     using dir = tempDir("direct-close-clean", {});

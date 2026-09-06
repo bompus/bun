@@ -1005,7 +1005,7 @@ static void installOneShotMethods(JSC::VM& vm, JSGlobalObject* globalObject, JSO
     auto* writeMethod = createOneShotBoundMethod(vm, globalObject, runtime->boundOneShotDirectWrite(), sink, 1, "write"_s);
     RETURN_IF_EXCEPTION(scope, );
     sink->putDirect(vm, builtinNames(vm).writePublicName(), writeMethod, 0);
-    auto* endMethod = createOneShotBoundMethod(vm, globalObject, runtime->boundOneShotDirectClose(), sink, 0, "end"_s);
+    auto* endMethod = createOneShotBoundMethod(vm, globalObject, runtime->boundOneShotDirectEnd(), sink, 0, "end"_s);
     RETURN_IF_EXCEPTION(scope, );
     sink->putDirect(vm, builtinNames(vm).endPublicName(), endMethod, 0);
     auto* closeMethod = createOneShotBoundMethod(vm, globalObject, runtime->boundOneShotDirectClose(), sink, 1, "close"_s);
@@ -1692,17 +1692,15 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundOneShotDirectWrite, (JSGlobalO
     RELEASE_AND_RETURN(scope, JSValue::encode(Bun::WebStreams::invokeMethod(vm, globalObject, sink->m_arrayBufferSink.get(), builtinNames(vm).writePublicName(), arguments)));
 }
 
-JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundOneShotDirectClose, (JSGlobalObject * globalObject, CallFrame* callFrame))
+// The one-shot controller's end() and close(reason). `reason` is the empty value for end(); a
+// truthy close(reason) is the source's failure and fails the conversion with it.
+static JSC::EncodedJSValue oneShotDirectClose(JSC::VM& vm, JSGlobalObject* globalObject, JSOneShotDirectSink* sink, JSValue reason)
 {
-    auto& vm = getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* sink = uncheckedDowncast<JSOneShotDirectSink>(callFrame->uncheckedArgument(0));
     if (sink->m_closed)
         return JSValue::encode(jsUndefined());
     sink->m_closed = true;
-    // close(reason) with a truthy reason is the source's failure.
-    JSValue reason = callFrame->argument(1);
-    const bool failed = reason.toBoolean(globalObject);
+    const bool failed = reason && reason.toBoolean(globalObject);
     JSValue closeFunction = sink->m_closeFunction.get();
     if (closeFunction.toBoolean(globalObject)) {
         auto callData = JSC::getCallData(closeFunction);
@@ -1711,7 +1709,8 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundOneShotDirectClose, (JSGlobalO
             return {};
         }
         MarkedArgumentBuffer closeArguments;
-        closeArguments.append(reason);
+        if (reason)
+            closeArguments.append(reason);
         JSC::call(globalObject, closeFunction, callData, jsUndefined(), closeArguments);
         RETURN_IF_EXCEPTION(scope, {});
     }
@@ -1738,6 +1737,18 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundOneShotDirectClose, (JSGlobalO
     if (auto* capability = sink->m_capabilityPromise.get(); capability && capability->status() == JSPromise::Status::Pending)
         capability->fulfill(vm, endResult);
     return JSValue::encode(jsUndefined());
+}
+
+JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundOneShotDirectEnd, (JSGlobalObject * globalObject, CallFrame* callFrame))
+{
+    auto* sink = uncheckedDowncast<JSOneShotDirectSink>(callFrame->uncheckedArgument(0));
+    return oneShotDirectClose(getVM(globalObject), globalObject, sink, {});
+}
+
+JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundOneShotDirectClose, (JSGlobalObject * globalObject, CallFrame* callFrame))
+{
+    auto* sink = uncheckedDowncast<JSOneShotDirectSink>(callFrame->uncheckedArgument(0));
+    return oneShotDirectClose(getVM(globalObject), globalObject, sink, callFrame->argument(1));
 }
 
 JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundOneShotDirectFlush, (JSGlobalObject * globalObject, CallFrame* callFrame))

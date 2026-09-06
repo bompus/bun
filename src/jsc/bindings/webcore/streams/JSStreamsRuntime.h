@@ -254,9 +254,10 @@ namespace WebCore {
     V(boundReadStreamIntoSinkOnReady)
 
 // owner: JSDirectStreamController.cpp — the FIVE detachable own methods of the direct
-// controller: `end` and `close` are two bound cells over the ONE boundDirectClose target.
+// controller. `end` ignores its argument; `close(reason)` with a truthy reason errors the stream.
 #define FOR_EACH_WEB_STREAMS_BOUND_HANDLER_TARGET_DIRECT_CONTROLLER(V) \
     V(boundDirectWrite)                                                \
+    V(boundDirectEnd)                                                  \
     V(boundDirectClose)                                                \
     V(boundDirectFlush)                                                \
     V(boundDirectError)
@@ -265,10 +266,11 @@ namespace WebCore {
 // (consumeDirectStreamToArrayBuffer). Its {start, write, end, close, flush} are OWN
 // JSBoundFunctions over these; context (argument 0) = the JSOneShotDirectSink cell. This
 // path deliberately does NOT reuse boundDirect* / JSDirectStreamController.
-#define FOR_EACH_WEB_STREAMS_BOUND_HANDLER_TARGET_ONE_SHOT(V)                                   \
-    V(boundOneShotStart) /* `start` is bound to this no-op target that returns undefined */     \
-    V(boundOneShotDirectWrite)                                                                  \
-    V(boundOneShotDirectClose) /* `end` and `close` are two bound cells over this one target */ \
+#define FOR_EACH_WEB_STREAMS_BOUND_HANDLER_TARGET_ONE_SHOT(V)                               \
+    V(boundOneShotStart) /* `start` is bound to this no-op target that returns undefined */ \
+    V(boundOneShotDirectWrite)                                                              \
+    V(boundOneShotDirectEnd)                                                                \
+    V(boundOneShotDirectClose) /* close(reason): a truthy reason fails the conversion */    \
     V(boundOneShotDirectFlush)
 
 // owner: JSStreamPipeToOperation.cpp — the pipe's AbortSignal abort algorithm.
