@@ -1714,8 +1714,7 @@ static void failOneShotDirectSink(JSC::VM& vm, JSGlobalObject* globalObject, JSO
     }
 }
 
-// end() passes an empty `reason`; a truthy close(reason) fails the conversion with it. A close() hook
-// that throws fails the conversion with its error, which is still thrown to the caller.
+// end() passes an empty `reason`. A truthy close(reason), or a close() hook that throws, fails the conversion.
 static JSC::EncodedJSValue oneShotDirectClose(JSC::VM& vm, JSGlobalObject* globalObject, JSOneShotDirectSink* sink, JSValue reason)
 {
     if (sink->m_closed)
