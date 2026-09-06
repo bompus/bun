@@ -2,7 +2,6 @@ import { describe, expect, it } from "bun:test";
 import { bunEnv, bunExe, isMusl, isWindows, nodeExe, tempDir } from "harness";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { childrenOf, describeSelf, describeTree, probeTracerSource, run } from "./functrace-probe-helpers.ts";
 import {
   mustGenerateOrderFile,
   orderFileEligible,
@@ -28,6 +27,7 @@ import {
   parseSymbolMap,
   symbolMapFor,
 } from "../../../../scripts/orderfile/windows-symbols.ts";
+import { childrenOf, describeSelf, describeTree, probeTracerSource, run } from "./functrace-probe-helpers.ts";
 
 /**
  * `<buildDir>/linker.order` lists the functions bun executes while starting up
