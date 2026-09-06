@@ -2,7 +2,8 @@
 // (linker-order.test.ts "records exact entries, and keeps them across an exec'd
 // child"). Everything here prints facts about a process tree that stopped
 // making progress; nothing here changes what the test asserts.
-import { readdirSync, readFileSync, readlinkSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 function readMaybe(path: string, max = 4096): string {
   try {
@@ -85,6 +86,133 @@ export async function run(cmd: string[]): Promise<string> {
     return (stdout + stderr).trimEnd();
   } catch (error) {
     return `<${error}>`;
+  }
+}
+
+/**
+ * The body of linker-order.test.ts's tracer case, callable from a generated
+ * test file so the same work runs inside a `bun test --parallel` worker that
+ * has already run other files. On a stall it prints the process tree, the
+ * tracer's own state, and which of stdout/stderr/exited settled.
+ */
+export async function runTracerCase(opts: {
+  /** Directory to build in. The caller owns it. */
+  root: string;
+  /** Appended by every run of a round. */
+  diag: string;
+  tag: string;
+  /** Print the step timings even when the run is fine. */
+  verbose?: boolean;
+  watchdogMs?: number;
+}): Promise<void> {
+  const { bunEnv } = await import("harness");
+  const { readTextSymbols } = await import("../../../../scripts/orderfile/generate.ts");
+  const orderfile = join(import.meta.dir, "../../../../scripts/orderfile");
+  const compiler = process.env.CC || Bun.which("cc") || Bun.which("clang") || Bun.which("gcc");
+  const { root, diag, tag } = opts;
+  const watchdogMs = opts.watchdogMs ?? 40_000;
+  const tracer = join(root, "functrace.so");
+  const fixture = join(root, "fixture");
+  const child = join(root, "child");
+  const starts = join(root, "starts.bin");
+  const trace = join(root, "trace.bin");
+
+  writeFileSync(join(root, "child.c"), "int main(void) { return 0; }\n");
+  writeFileSync(
+    join(root, "functrace-probe.c"),
+    probeTracerSource(readFileSync(join(orderfile, "functrace.c"), "utf8")),
+  );
+
+  const t0 = performance.now();
+  const steps: string[] = [];
+  const step = (name: string) => steps.push(`${name}@${(performance.now() - t0).toFixed(0)}ms`);
+  const settled = { stdout: false, stderr: false, exited: false };
+  let spawned: Bun.Subprocess | undefined;
+
+  async function compile(args: string[]) {
+    await using proc = Bun.spawn({ cmd: [compiler!, "-O1", ...args], env: bunEnv, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    if (exitCode !== 0) throw new Error(`${compiler} ${args.join(" ")} exited ${exitCode}:\n${stdout}${stderr}`);
+  }
+
+  const watchdog = setTimeout(async () => {
+    const lines = [
+      `=== functrace ${tag} STALLED after ${watchdogMs} ms: steps ${steps.join(" ")}; fixture pid=${spawned?.pid} settled=${JSON.stringify(settled)} exitCode=${spawned?.exitCode} signal=${spawned?.signalCode}`,
+      describeSelf(),
+      describeProc(process.pid),
+    ];
+    if (spawned) {
+      lines.push(describeTree(spawned.pid));
+      try {
+        process.kill(spawned.pid, "SIGUSR1");
+      } catch (error) {
+        lines.push(`SIGUSR1: ${error}`);
+      }
+      await Bun.sleep(500);
+    }
+    lines.push(
+      `--- ps\n${await run(["sh", "-c", "ps -eo pid,ppid,pgid,stat,wchan:32,etime,time,args --forest | grep -v 'ps -eo' | head -80"])}`,
+    );
+    lines.push(`--- tracer diag\n${existsSync(diag) ? readFileSync(diag, "utf8").slice(-60_000) : "<none>"}`);
+    console.error(lines.join("\n"));
+    if (spawned) {
+      for (const pid of [...childrenOf(spawned.pid), spawned.pid]) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {}
+      }
+    }
+  }, watchdogMs);
+
+  try {
+    await Promise.all([
+      compile(["-shared", "-fPIC", "-o", tracer, join(root, "functrace-probe.c"), "-ldl", "-lpthread"]).then(() =>
+        step("tracer"),
+      ),
+      compile(["-o", fixture, join(import.meta.dir, "functrace-fixture.c")]).then(() => step("fixture")),
+      compile(["-o", child, join(root, "child.c")]).then(() => step("child")),
+    ]);
+    const symbols = readTextSymbols(fixture);
+    step("nm");
+    if (symbols.size <= 33) throw new Error(`nm listed ${symbols.size} text symbols`);
+    const list = [...symbols.keys()].map(BigInt);
+    const words = new BigUint64Array(3 + list.length);
+    words.set([0x4e55425354525453n, 1n, BigInt(list.length)], 0);
+    words.set(list, 3);
+    await Bun.write(starts, new Uint8Array(words.buffer));
+    step("starts");
+
+    await using proc = Bun.spawn({
+      cmd: [fixture, child],
+      env: {
+        ...bunEnv,
+        LD_PRELOAD: tracer,
+        BUN_FUNCTRACE_STARTS: starts,
+        BUN_FUNCTRACE_OUT: trace,
+        BUN_FUNCTRACE_DIAG: diag,
+        BUN_FUNCTRACE_DIAG_ALARM: String(Math.floor(watchdogMs / 1000) - 4),
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    spawned = proc;
+    step(`spawn(${proc.pid})`);
+    const [stdout, stderr, exitCode] = await Promise.all([
+      proc.stdout.text().finally(() => ((settled.stdout = true), step("stdout"))),
+      proc.stderr.text().finally(() => ((settled.stderr = true), step("stderr"))),
+      proc.exited.finally(() => ((settled.exited = true), step("exited"))),
+    ]);
+    if (stdout.trim() !== "497" || stderr !== "" || exitCode !== 0) {
+      throw new Error(`${tag}: stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)} exit=${exitCode}`);
+    }
+    const entries = new BigUint64Array(await Bun.file(trace).arrayBuffer());
+    if (entries[0] !== 0x4e55424543415254n || Number(entries[4]) < 34) {
+      throw new Error(`${tag}: trace magic ${entries[0]} entries ${entries[4]}`);
+    }
+    step("done");
+    if (opts.verbose) console.error(`functrace steps: ${steps.join(" ")}`);
+  } finally {
+    clearTimeout(watchdog);
   }
 }
 

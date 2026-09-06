@@ -6,7 +6,7 @@
 // that stops making progress is stuck. It asserts only that no run hung.
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, isLinux, isMusl, tempDir } from "harness";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { availableParallelism } from "node:os";
 import { join } from "node:path";
 import { readTextSymbols } from "../../../../scripts/orderfile/generate.ts";
@@ -353,9 +353,85 @@ test/regression/issue/issue-1825-jest-mock-functions.test.ts
     .trim()
     .split("\n");
 
+  /**
+   * The CI hang happens in a `--parallel` worker that already ran other files,
+   * and not in the 2400 standalone runs above. So run the tracer case inside
+   * such a worker many times per round: one generated file per case, three
+   * workers, the real batch's files mixed in for the state they leave behind.
+   * A stalled case prints its own diagnosis (runTracerCase).
+   */
+  test.skipIf(!isLinux)(
+    "the tracer case inside parallel workers, many times",
+    async () => {
+      const repo = join(import.meta.dir, "../../../..");
+      const helpers = join(import.meta.dir, "functrace-probe-helpers.ts");
+      const cases = process.arch === "arm64" ? 48 : 12;
+      const rounds = process.arch === "arm64" ? 12 : 1;
+      const neighbors = BATCH.filter(f =>
+        /bundler_loader|webview\/webview\.test|bun-serve-html\.test|fifo|filesink|spawn\.ipc|sqlite-sql|heap-prof|websocket-pause|self-reference|pipeline_stack|bun_test\.test/.test(
+          f,
+        ),
+      );
+      using generated = tempDir("functrace-cases", {});
+      const dir = String(generated);
+      const files: string[] = [];
+      for (let i = 0; i < cases; i++) {
+        const file = join(dir, `tracer-${String(i).padStart(3, "0")}.test.ts`);
+        writeFileSync(
+          file,
+          [
+            `import { test } from "bun:test";`,
+            `import { mkdirSync } from "node:fs";`,
+            `import { runTracerCase } from ${JSON.stringify(helpers)};`,
+            `test(${JSON.stringify(`traced fixture ${i}`)}, async () => {`,
+            `  const root = ${JSON.stringify(join(dir, `case-${i}`))};`,
+            `  mkdirSync(root, { recursive: true });`,
+            `  await runTracerCase({ root, diag: ${JSON.stringify(join(dir, "diag.txt"))}, tag: ${JSON.stringify(`case-${i}`)} });`,
+            `}, 65000);`,
+            ``,
+          ].join("\n"),
+        );
+        files.push(file);
+      }
+
+      let stalls = 0;
+      const t0 = performance.now();
+      for (let round = 0; round < rounds && stalls < 2; round++) {
+        await using proc = Bun.spawn({
+          cmd: [bunExe(), "test", "--parallel=3", "--timeout=70000", "--dots", ...files, ...neighbors],
+          cwd: repo,
+          env: bunEnv,
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [stdout, stderr] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        const out = stdout + stderr;
+        const summary = /Ran \d+ tests across \d+ files\. \[[^\]]+\]/.exec(out)?.[0] ?? `exit ${proc.exitCode}`;
+        const bad = /STALLED|timed out|REPEAT trap/.test(out);
+        const { repeats } = repeatsIn(join(dir, "diag.txt"));
+        console.log(`round ${round}: ${cases} cases, ${summary}, ${repeats} repeat traps${bad ? " BAD" : ""}`);
+        if (bad) {
+          stalls++;
+          console.error(
+            `=== round ${round} output (filtered)\n${out
+              .split("\n")
+              .filter(line => !/^[.\s]*$/.test(line))
+              .slice(-600)
+              .join("\n")}`,
+          );
+        }
+      }
+      console.log(
+        `tracer cases in workers: ${rounds * cases} planned, ${((performance.now() - t0) / 1000).toFixed(1)} s, ${stalls} rounds with a stall`,
+      );
+      expect(stalls).toBe(0);
+    },
+    1_800_000,
+  );
+
   test("linker-order.test.ts inside the parallel batch that hung", async () => {
     const repo = join(import.meta.dir, "../../../..");
-    const rounds = process.arch === "arm64" ? 6 : 2;
+    const rounds = process.arch === "arm64" ? 4 : 1;
     let timedOut = 0;
     const t0 = performance.now();
     for (let i = 0; i < rounds && timedOut < 2; i++) {
