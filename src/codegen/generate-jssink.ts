@@ -143,8 +143,7 @@ function header() {
 
                 ~${controller}();
 
-                // \`reason\` reaches onClose: undefined for a clean close,
-                // otherwise the failure the source closed with.
+                // \`reason\` is forwarded to onClose.
                 void detach(JSC::JSValue reason = JSC::jsUndefined());
 
                 void start(JSC::JSGlobalObject *globalObject, JSC::JSValue readableStream, JSC::JSValue onPull, JSC::JSValue onClose);
@@ -399,7 +398,6 @@ static JSC::EncodedJSValue ${controller}__closeWithReason(JSC::JSGlobalObject* l
 
     ${name}__close(lexicalGlobalObject, ptr, reason);
 
-    // onClose reads a truthy reason as the source's failure.
     JSC::JSValue closeReason = JSC::JSValue::decode(reason);
     if (closeReason.isEmpty())
         closeReason = JSC::jsUndefined();

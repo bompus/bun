@@ -1099,7 +1099,7 @@ JSValue consumeDirectStreamToArrayBuffer(JSGlobalObject* globalObject, WebCore::
     stream->m_lockedWithoutReader = false;
     readableStreamCloseIfPossible(globalObject, stream);
     RETURN_IF_EXCEPTION(scope, {});
-    // close(reason) marked the capability handled; the caller's promise must not be.
+    // close(reason) rejected the capability and marked it handled; the caller gets an unhandled one.
     if (capability->status() == JSPromise::Status::Rejected)
         RELEASE_AND_RETURN(scope, promiseRejectedWith(globalObject, capability->result()));
     return capability;
@@ -1692,8 +1692,7 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundOneShotDirectWrite, (JSGlobalO
     RELEASE_AND_RETURN(scope, JSValue::encode(Bun::WebStreams::invokeMethod(vm, globalObject, sink->m_arrayBufferSink.get(), builtinNames(vm).writePublicName(), arguments)));
 }
 
-// The one-shot controller's end() and close(reason). `reason` is the empty value for end(); a
-// truthy close(reason) is the source's failure and fails the conversion with it.
+// end() passes an empty `reason`; a truthy close(reason) fails the conversion with it.
 static JSC::EncodedJSValue oneShotDirectClose(JSC::VM& vm, JSGlobalObject* globalObject, JSOneShotDirectSink* sink, JSValue reason)
 {
     auto scope = DECLARE_THROW_SCOPE(vm);
@@ -1723,7 +1722,6 @@ static JSC::EncodedJSValue oneShotDirectClose(JSC::VM& vm, JSGlobalObject* globa
             Bun::WebStreams::readableStreamError(globalObject, stream, reason);
             RETURN_IF_EXCEPTION(scope, {});
         }
-        // The rejection reaches the consumer through the promise returned for the conversion.
         if (auto* capability = sink->m_capabilityPromise.get(); capability && capability->status() == JSPromise::Status::Pending) {
             Bun::WebStreams::rejectPromise(globalObject, capability, reason);
             RETURN_IF_EXCEPTION(scope, {});

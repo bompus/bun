@@ -21,9 +21,7 @@ public:
     static JSC::Structure* createStructure(JSC::VM&, JSC::JSGlobalObject*, JSC::JSValue prototype);
 
     DECLARE_INFO;
-    // visitChildrenImpl MUST visit ALL FOUR: m_underlyingSource, m_sinkController,
-    // m_closePromise, m_closeReason. (An unvisited m_closePromise is a premature collection
-    // of the promise handed to Rust.)
+    // MUST visit every barrier below: Rust holds m_closePromise only through this cell.
     DECLARE_VISIT_CHILDREN;
     static void analyzeHeap(JSCell*, JSC::HeapAnalyzer&);
 
@@ -44,8 +42,7 @@ public:
     // the close-capability promise returned to the caller when `pull` returned synchronously
     // without closing; initially null, armed by readDirectStream, settled by onClose.
     JSC::WriteBarrier<JSC::JSPromise> m_closePromise;
-    // the truthy reason of a `controller.close(reason)`; when `pull` returned a promise, its
-    // settlement reaction rejects the pump's result with it.
+    // a truthy `controller.close(reason)`: the pump's result rejects with it.
     JSC::WriteBarrier<JSC::Unknown> m_closeReason;
 
 private:

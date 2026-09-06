@@ -1737,9 +1737,7 @@ impl FileSink {
                         self.handle_resolve_stream();
                     }
                     bun_jsc::js_promise::Status::Rejected => {
-                        // These don't ref().
-                        // Consumed here, as the Pending arm's on_reject_stream
-                        // consumes a later rejection: not an unhandledRejection.
+                        // These don't ref(). Consumed here, so not an unhandledRejection.
                         // SAFETY: `js_promise` is non-null (`as_any_promise`).
                         let result = unsafe {
                             (*js_promise).set_handled();

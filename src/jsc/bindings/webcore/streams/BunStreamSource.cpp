@@ -757,8 +757,7 @@ static void readDirectStreamCloseImpl(JSC::VM& vm, JSGlobalObject* globalObject,
     JSObject* underlyingSource = state->m_underlyingSource.get();
     state->m_underlyingSource.clear();
 
-    // A truthy reason is the source's failure: it errors the stream and rejects the pump's
-    // result, so the sink's owner sees a truncated body instead of a clean end.
+    // A truthy reason is the source's failure: the stream errors and the pump's result rejects.
     const bool failed = reason.toBoolean(globalObject);
     if (failed)
         state->m_closeReason.set(vm, state, reason);
@@ -880,7 +879,7 @@ JSValue readDirectStream(JSGlobalObject* globalObject, JSReadableStream* stream,
         state->m_closePromise.set(vm, state, closePromise);
         return closePromise;
     }
-    // pull() closed the stream before it returned. A close(reason) is a failed pump.
+    // pull() closed the stream before it returned; close(reason) makes that a failed pump.
     if (JSValue closeReason = state->m_closeReason.get())
         return promiseRejectedWith(globalObject, closeReason);
     return jsUndefined();
@@ -1356,8 +1355,7 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_onNativeSourceCallCloseMicrotask, (
     return JSValue::encode(jsUndefined());
 }
 
-// readDirectStream's pull() promise fulfilled: the pump's result follows the stream. A
-// close(reason) that ran while pull() was pending makes it reject with that reason.
+// readDirectStream's pull() promise fulfilled: a close(reason) that ran meanwhile rejects the pump.
 JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_onReadDirectStreamPullFulfilled, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
     auto& vm = getVM(globalObject);
