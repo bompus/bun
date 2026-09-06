@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { bunEnv, bunExe, isMusl, isWindows, nodeExe, tempDir } from "harness";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { childrenOf, describeSelf, describeTree, probeTracerSource, run } from "./functrace-probe-helpers.ts";
 import {
   mustGenerateOrderFile,
   orderFileEligible,
@@ -618,36 +619,107 @@ async function expectFixtureTrace(trace: string, symbols: Map<number, string[]>)
  */
 describe.skipIf(!canTrace || isWindows)("function tracer", () => {
   it.concurrent("records exact entries, and keeps them across an exec'd child", async () => {
-    using dir = tempDir("functrace", { "child.c": "int main(void) { return 0; }\n" });
+    // Probe build: the tracer carries a watchdog that writes its state to `diag`
+    // (functrace-probe-helpers.ts), and this test says where it is every step.
+    const probing = process.platform === "linux";
+    using dir = tempDir("functrace", {
+      "child.c": "int main(void) { return 0; }\n",
+      "functrace-probe.c": probing ? probeTracerSource(readFileSync(join(orderfile, "functrace.c"), "utf8")) : "",
+    });
     const root = String(dir);
     const tracer = join(root, darwin ? "functrace.dylib" : "functrace.so");
     const fixture = join(root, "fixture");
     const child = join(root, "child");
     const starts = join(root, "starts.bin");
     const trace = join(root, "trace.bin");
+    const diag = join(root, "diag.txt");
 
-    await Promise.all([
-      compile([...shared, "-o", tracer, join(orderfile, "functrace.c"), ...(darwin ? [] : ["-ldl", "-lpthread"])]),
-      compile(["-o", fixture, join(import.meta.dir, "functrace-fixture.c")]),
-      compile(["-o", child, join(root, "child.c")]),
-    ]);
+    const t0 = performance.now();
+    const steps: string[] = [];
+    const step = (name: string) => steps.push(`${name}@${(performance.now() - t0).toFixed(0)}ms`);
+    let spawned: Bun.Subprocess | undefined;
+    const settled = { stdout: false, stderr: false, exited: false };
+    const watchdog = setTimeout(async () => {
+      const lines = [
+        `=== functrace watchdog: pid ${process.pid} stuck after ${steps.join(" ")}; fixture pid=${spawned?.pid} settled=${JSON.stringify(settled)} exitCode=${spawned?.exitCode} signal=${spawned?.signalCode}`,
+        describeSelf(),
+      ];
+      if (spawned) {
+        lines.push(describeTree(spawned.pid));
+        try {
+          process.kill(spawned.pid, "SIGUSR1");
+        } catch (error) {
+          lines.push(`SIGUSR1: ${error}`);
+        }
+        await Bun.sleep(500);
+      }
+      lines.push(
+        `--- ps\n${await run(["sh", "-c", "ps -eo pid,ppid,pgid,stat,wchan:32,etime,time,args --forest | grep -v 'ps -eo' | head -80"])}`,
+      );
+      lines.push(`--- tracer diag\n${existsSync(diag) ? readFileSync(diag, "utf8") : "<none>"}`);
+      console.error(lines.join("\n"));
+      if (spawned) {
+        for (const pid of [...childrenOf(spawned.pid), spawned.pid]) {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {}
+        }
+        await Bun.sleep(2000);
+        console.error(
+          `--- after SIGKILL: settled=${JSON.stringify(settled)} exitCode=${spawned.exitCode} signal=${spawned.signalCode}`,
+        );
+      }
+    }, 40_000);
 
-    // The starts file the generator would write, from the same symbol reader.
-    const symbols = readTextSymbols(fixture);
-    expect(symbols.size).toBeGreaterThan(33);
-    await writeStarts(starts, symbols.keys());
+    try {
+      await Promise.all([
+        compile([
+          ...shared,
+          "-o",
+          tracer,
+          probing ? join(root, "functrace-probe.c") : join(orderfile, "functrace.c"),
+          ...(darwin ? [] : ["-ldl", "-lpthread"]),
+        ]).then(() => step("tracer")),
+        compile(["-o", fixture, join(import.meta.dir, "functrace-fixture.c")]).then(() => step("fixture")),
+        compile(["-o", child, join(root, "child.c")]).then(() => step("child")),
+      ]);
 
-    // The child is dynamically linked, so it inherits the preload.
-    await using proc = Bun.spawn({
-      cmd: [fixture, child],
-      env: { ...bunEnv, [preloadVar]: tracer, BUN_FUNCTRACE_STARTS: starts, BUN_FUNCTRACE_OUT: trace },
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
-    expect({ stdout: stdout.trim(), stderr, exitCode }).toEqual({ stdout: "497", stderr: "", exitCode: 0 });
+      // The starts file the generator would write, from the same symbol reader.
+      const symbols = readTextSymbols(fixture);
+      step("nm");
+      expect(symbols.size).toBeGreaterThan(33);
+      await writeStarts(starts, symbols.keys());
+      step("starts");
 
-    await expectFixtureTrace(trace, symbols);
+      // The child is dynamically linked, so it inherits the preload.
+      await using proc = Bun.spawn({
+        cmd: [fixture, child],
+        env: {
+          ...bunEnv,
+          [preloadVar]: tracer,
+          BUN_FUNCTRACE_STARTS: starts,
+          BUN_FUNCTRACE_OUT: trace,
+          BUN_FUNCTRACE_DIAG: diag,
+          BUN_FUNCTRACE_DIAG_ALARM: "30",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      spawned = proc;
+      step(`spawn(${proc.pid})`);
+      const [stdout, stderr, exitCode] = await Promise.all([
+        proc.stdout.text().finally(() => ((settled.stdout = true), step("stdout"))),
+        proc.stderr.text().finally(() => ((settled.stderr = true), step("stderr"))),
+        proc.exited.finally(() => ((settled.exited = true), step("exited"))),
+      ]);
+      expect({ stdout: stdout.trim(), stderr, exitCode }).toEqual({ stdout: "497", stderr: "", exitCode: 0 });
+
+      await expectFixtureTrace(trace, symbols);
+      step("done");
+      if (process.env.BUN_FUNCTRACE_PROBE) console.error(`functrace steps: ${steps.join(" ")}`);
+    } finally {
+      clearTimeout(watchdog);
+    }
   });
 });
 
