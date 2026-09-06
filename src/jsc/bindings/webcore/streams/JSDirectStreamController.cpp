@@ -892,8 +892,7 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundDirectWrite, (JSGlobalObject *
     return JSValue::encode(wrote);
 }
 
-// controller.end() and a clean close(): a failure part-way (the sink's end(), the source's close()
-// hook) errors the stream so a pending read settles, and is still thrown to the caller.
+// end() and a clean close(): a throw from the sink's end() or the close() hook errors the stream and rethrows.
 static JSC::EncodedJSValue closeDirectControllerFromJS(JSC::VM& vm, JSGlobalObject* globalObject, JSDirectStreamController* controller, JSValue reason)
 {
     return enterStreams(globalObject, [&] { controller->onClose(globalObject, reason); }, [&](JSValue error) {

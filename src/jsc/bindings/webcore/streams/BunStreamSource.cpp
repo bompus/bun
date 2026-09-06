@@ -1355,8 +1355,7 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_onNativeSourceCallCloseMicrotask, (
     return JSValue::encode(jsUndefined());
 }
 
-// readDirectStream's pull() promise settled. A close(reason) that ran meanwhile already errored the
-// stream with that reason, so the pump rejects with it; otherwise the pump follows pull()'s promise.
+// readDirectStream's pull() settled: a close(reason) that ran meanwhile is what the pump rejects with.
 JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_onReadDirectStreamPullFulfilled, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
     auto& vm = getVM(globalObject);
