@@ -32,7 +32,8 @@ public:
 
     DECLARE_INFO;
     // visitChildrenImpl MUST visit: m_stream, m_underlyingSource, m_pull, m_pendingRead,
-    // m_deferCloseReason, m_arrayBufferSink, m_array, m_closingPromise, m_finalChunk, and
+    // m_deferCloseReason, m_arrayBufferSink, m_array, m_closingPromise, m_finalChunk,
+    // m_writePending, and
     // the barrier container m_textAccumulator.pieces (via
     // m_textAccumulator.visit(locker, visitor) inside ONE `Locker { cellLock() }` scope
     // taken by THIS visitChildrenImpl — cellLock() is non-recursive; see StreamQueue.h).
@@ -103,6 +104,19 @@ public:
     // Final-chunk-on-close: the NEXT read() delivers m_finalChunk then closes. onPull checks
     // m_finalChunkArmed FIRST.
     JSC::WriteBarrier<JSC::Unknown> m_finalChunk;
+
+    // Backpressure of the ArrayBuffer sink, the same contract as the native sinks: once the
+    // bytes buffered since the last drain reach m_highWaterMark, write() returns one pending
+    // Promise<number> (shared by every write until the drain). A drain (flush/end delivering
+    // to a reader) fulfills it with the last write's length; a teardown (error, cancel)
+    // fulfills it with false.
+    JSC::WriteBarrier<JSC::JSPromise> m_writePending;
+    double m_bufferedBytes { 0 };
+    double m_highWaterMark { 0 };
+    double m_pendingWriteLength { 0 };
+    // The reader took everything the sink held: settles m_writePending if armed.
+    void onDrain(JSC::JSGlobalObject*);
+    void settleWritePending(JSC::JSGlobalObject*, JSC::JSValue);
 
     // The state machine. All userJS: YES.
     // The READ pump: every default-reader read on a Direct stream lands here. A promise-backed

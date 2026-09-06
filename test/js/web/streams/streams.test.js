@@ -801,6 +801,198 @@ describe("multi-chunk consumers produce exactly the concatenated bytes", () => {
     expect(value.byteLength).toBe(10);
   });
 
+  // The producer may not run ahead of a JS reader: once the bytes it wrote and nobody has
+  // read yet reach the highWaterMark, write() returns a pending promise that resolves when
+  // a read drains them (the same contract as a native sink).
+  describe("a direct stream's controller.write() signals backpressure to a JS reader", () => {
+    const macrotask = () => new Promise(resolve => setImmediate(resolve));
+    const CHUNKS = 40;
+
+    const makeSource = (chunkSize, counters) => ({
+      type: "direct",
+      async pull(c) {
+        for (let i = 0; i < CHUNKS; i++) {
+          const wrote = c.write(new Uint8Array(chunkSize).fill(i));
+          counters.writes++;
+          if (wrote instanceof Promise) {
+            counters.promises++;
+            counters.resolved.push(await wrote);
+          } else {
+            counters.resolved.push(wrote);
+          }
+        }
+        c.end();
+      },
+    });
+
+    for (const [label, chunkSize, strategy] of [
+      ["default highWaterMark", 64 * 1024, undefined],
+      ["explicit highWaterMark", 1024, { highWaterMark: 4096 }],
+    ]) {
+      it(`getReader(): ${label}`, async () => {
+        const counters = { writes: 0, promises: 0, resolved: [] };
+        const rs = new ReadableStream(makeSource(chunkSize, counters), strategy);
+        const reader = rs.getReader();
+        const first = await reader.read();
+        expect(first.done).toBe(false);
+        // Give the producer every chance to run ahead while the reader is idle.
+        await macrotask();
+        await macrotask();
+        const hwm = strategy?.highWaterMark ?? 64 * 1024;
+        const writesPerDrain = Math.ceil(hwm / chunkSize);
+        // One drain's worth was delivered, at most one more is parked in the sink.
+        expect(counters.writes).toBeLessThanOrEqual(2 * writesPerDrain);
+        expect(counters.promises).toBeGreaterThan(0);
+
+        let total = first.value.byteLength;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.byteLength;
+        }
+        expect(total).toBe(CHUNKS * chunkSize);
+        expect(counters.writes).toBe(CHUNKS);
+        // A write under backpressure resolves with its own byte count once drained.
+        expect(counters.resolved).toEqual(Array(CHUNKS).fill(chunkSize));
+      });
+    }
+
+    it("pipeTo(): a stalled WritableStream parks the producer", async () => {
+      const counters = { writes: 0, promises: 0, resolved: [] };
+      const rs = new ReadableStream(makeSource(64 * 1024, counters));
+      const received = [];
+      const { promise: stalled, resolve: stall } = Promise.withResolvers();
+      const { promise: gate, resolve: open } = Promise.withResolvers();
+      let gated = true;
+      const piped = rs.pipeTo(
+        new WritableStream(
+          {
+            write(chunk) {
+              received.push(chunk.byteLength);
+              if (!gated) return;
+              stall();
+              return gate;
+            },
+          },
+          { highWaterMark: 1 },
+        ),
+      );
+      await stalled;
+      await macrotask();
+      await macrotask();
+      expect(received).toEqual([64 * 1024]);
+      expect(counters.writes).toBeLessThanOrEqual(3);
+      expect(counters.promises).toBeGreaterThan(0);
+      gated = false;
+      open();
+      await piped;
+      expect(received.reduce((a, b) => a + b, 0)).toBe(CHUNKS * 64 * 1024);
+      expect(counters.writes).toBe(CHUNKS);
+    });
+
+    it("cancel() wakes a parked producer with false", async () => {
+      const results = [];
+      const { promise: parked, resolve: park } = Promise.withResolvers();
+      const { promise: pullDone, resolve: finishPull } = Promise.withResolvers();
+      const rs = new ReadableStream({
+        type: "direct",
+        async pull(c) {
+          // Drained by the first read.
+          results.push(await c.write(new Uint8Array(64 * 1024)));
+          // Nobody reads: parked until the cancel.
+          const second = c.write(new Uint8Array(64 * 1024));
+          park();
+          results.push(await second);
+          // The controller is closed.
+          results.push(c.write(new Uint8Array(8)));
+          finishPull();
+        },
+      });
+      const reader = rs.getReader();
+      await reader.read();
+      await parked;
+      await reader.cancel();
+      await pullDone;
+      expect(results).toEqual([64 * 1024, false, 0]);
+    });
+  });
+
+  // https://github.com/oven-sh/bun/issues/18315
+  describe("cancel() reaches a direct source's cancel(reason) hook", () => {
+    it("after a read", async () => {
+      const events = [];
+      const rs = new ReadableStream({
+        type: "direct",
+        async pull(c) {
+          c.write("x");
+          await new Promise(() => {});
+        },
+        cancel(reason) {
+          events.push(["cancel", reason]);
+        },
+      });
+      const reader = rs.getReader();
+      await reader.read();
+      expect(await reader.cancel("bye")).toBeUndefined();
+      expect(events).toEqual([["cancel", "bye"]]);
+    });
+
+    it("before the first read", async () => {
+      const events = [];
+      const rs = new ReadableStream({
+        type: "direct",
+        pull() {
+          events.push(["pull"]);
+        },
+        cancel(reason) {
+          events.push(["cancel", reason]);
+        },
+      });
+      expect(await rs.cancel("early")).toBeUndefined();
+      expect(events).toEqual([["cancel", "early"]]);
+    });
+
+    it("a throwing hook rejects cancel()", async () => {
+      const rs = new ReadableStream({
+        type: "direct",
+        pull(c) {
+          c.write("x");
+        },
+        cancel() {
+          throw new Error("nope");
+        },
+      });
+      const reader = rs.getReader();
+      await reader.read();
+      await expect(reader.cancel()).rejects.toThrow("nope");
+    });
+
+    it("not after end(): the source already saw close()", async () => {
+      const events = [];
+      let ctrl;
+      const rs = new ReadableStream({
+        type: "direct",
+        pull(c) {
+          ctrl = c;
+          c.write("a");
+        },
+        cancel(reason) {
+          events.push(["cancel", reason]);
+        },
+        close() {
+          events.push(["close"]);
+        },
+      });
+      const reader = rs.getReader();
+      await reader.read();
+      // end() with nobody reading arms the final chunk: the stream stays readable.
+      ctrl.write("b");
+      ctrl.end();
+      expect(await reader.cancel("late")).toBeUndefined();
+      expect(events).toEqual([["close"]]);
+    });
+  });
+
   // A type:"direct" pull() is re-invoked per read as a demand signal, but never while a
   // previous async pull() is still pending and never after end(). A pull that writes the
   // whole body and ends therefore runs exactly once.

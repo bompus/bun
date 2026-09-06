@@ -109,6 +109,7 @@ void JSDirectStreamController::visitChildrenImpl(JSCell* cell, Visitor& visitor)
     visitor.appendHidden(thisObject->m_array);
     visitor.appendHidden(thisObject->m_closingPromise);
     visitor.appendHidden(thisObject->m_finalChunk);
+    visitor.appendHidden(thisObject->m_writePending);
     Locker locker { thisObject->cellLock() };
     thisObject->m_textAccumulator.visit(locker, visitor);
 }
@@ -127,6 +128,7 @@ void JSDirectStreamController::analyzeHeap(JSCell* cell, HeapAnalyzer& analyzer)
     analyzeBarrierEdge(vm, analyzer, cell, thisObject->m_array, "array"_s);
     analyzeBarrierEdge(vm, analyzer, cell, thisObject->m_closingPromise, "closingPromise"_s);
     analyzeBarrierEdge(vm, analyzer, cell, thisObject->m_finalChunk, "finalChunk"_s);
+    analyzeBarrierEdge(vm, analyzer, cell, thisObject->m_writePending, "writePending"_s);
     WTF::Locker locker { thisObject->cellLock() };
     thisObject->m_textAccumulator.analyzeHeap(locker, cell, analyzer);
 }
@@ -140,6 +142,21 @@ static size_t byteLengthOf(JSValue value)
         return (!impl || impl->isDetached()) ? 0 : impl->byteLength();
     }
     return 0;
+}
+
+void JSDirectStreamController::settleWritePending(JSGlobalObject* globalObject, JSValue value)
+{
+    auto* promise = m_writePending.get();
+    if (!promise)
+        return;
+    m_writePending.clear();
+    promise->fulfill(getVM(globalObject), value);
+}
+
+void JSDirectStreamController::onDrain(JSGlobalObject* globalObject)
+{
+    m_bufferedBytes = 0;
+    settleWritePending(globalObject, jsNumber(m_pendingWriteLength));
 }
 
 static JSValue callArrayBufferSinkMethod(JSC::VM& vm, JSGlobalObject* globalObject, JSObject* sink, const Identifier& name, MarkedArgumentBuffer& args)
@@ -371,6 +388,8 @@ static JSValue endDirectSink(JSC::VM& vm, JSGlobalObject* globalObject, JSDirect
         JSValue flushed = callArrayBufferSinkMethod(vm, globalObject, sink, builtinNames(vm).endPublicName(), args);
         RETURN_IF_EXCEPTION(scope, {});
         controller->m_arrayBufferSink.clear();
+        controller->onDrain(globalObject);
+        RETURN_IF_EXCEPTION(scope, {});
         return flushed;
     }
     case DirectSinkKind::Text:
@@ -385,13 +404,18 @@ static JSValue endDirectSink(JSC::VM& vm, JSGlobalObject* globalObject, JSDirect
 // `sink.flush()`: only the ArrayBuffer sink produces bytes; the Text/Array sinks return 0.
 static JSValue flushDirectSink(JSC::VM& vm, JSGlobalObject* globalObject, JSDirectStreamController* controller)
 {
+    auto scope = DECLARE_THROW_SCOPE(vm);
     switch (controller->m_sinkKind) {
     case DirectSinkKind::ArrayBuffer: {
         JSObject* sink = controller->m_arrayBufferSink.get();
         if (!sink) [[unlikely]]
             return jsNumber(0);
         MarkedArgumentBuffer args;
-        return callArrayBufferSinkMethod(vm, globalObject, sink, builtinNames(vm).flushPublicName(), args);
+        JSValue flushed = callArrayBufferSinkMethod(vm, globalObject, sink, builtinNames(vm).flushPublicName(), args);
+        RETURN_IF_EXCEPTION(scope, {});
+        controller->onDrain(globalObject);
+        RETURN_IF_EXCEPTION(scope, {});
+        return flushed;
     }
     case DirectSinkKind::Text:
     case DirectSinkKind::Array:
@@ -456,6 +480,8 @@ bool JSDirectStreamController::handleError(JSGlobalObject* globalObject, JSValue
     m_closed = true;
     JSObject* underlyingSource = m_underlyingSource.get();
     directStreamControllerClearSource(this);
+    settleWritePending(globalObject, jsBoolean(false));
+    RETURN_IF_EXCEPTION(scope, false);
 
     bool delivered = false;
     if (auto* pendingRead = m_pendingRead.get()) {
@@ -889,6 +915,20 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundDirectWrite, (JSGlobalObject *
     RETURN_IF_EXCEPTION(scope, {});
     controller->armEndOfTickFlush(globalObject);
     RETURN_IF_EXCEPTION(scope, {});
+    // Only the ArrayBuffer sink drains to a reader; the Text/Array sinks hold everything
+    // until end() by design, so a promise from them could never settle.
+    if (controller->m_sinkKind == DirectSinkKind::ArrayBuffer && wrote.isNumber()) {
+        double length = wrote.asNumber();
+        if (length > 0) {
+            controller->m_bufferedBytes += length;
+            if (controller->m_bufferedBytes >= controller->m_highWaterMark) {
+                controller->m_pendingWriteLength = length;
+                if (!controller->m_writePending)
+                    controller->m_writePending.set(vm, controller, JSPromise::create(vm, globalObject->promiseStructure()));
+                return JSValue::encode(controller->m_writePending.get());
+            }
+        }
+    }
     return JSValue::encode(wrote);
 }
 
@@ -917,6 +957,11 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundDirectFlush, (JSGlobalObject *
         return JSValue::encode(jsUndefined());
     controller->onFlush(globalObject);
     RETURN_IF_EXCEPTION(scope, {});
+    // flush(true): await the drain, the same promise write() returned under backpressure.
+    if (callFrame->argument(1).toBoolean(globalObject)) {
+        if (auto* writePending = controller->m_writePending.get())
+            return JSValue::encode(writePending);
+    }
     return JSValue::encode(jsUndefined());
 }
 
@@ -969,6 +1014,9 @@ using namespace JSC;
 using WebCore::JSDirectStreamController;
 using WebCore::JSStreamsRuntime;
 
+// Bytes a JS reader may leave untaken before write() starts to return a pending promise.
+static constexpr double defaultDirectHighWaterMark = 64 * 1024;
+
 void directStreamControllerClearSource(JSDirectStreamController* controller)
 {
     controller->m_underlyingSource.clear();
@@ -995,6 +1043,11 @@ void setUpDirectStreamController(JSC::JSGlobalObject* globalObject, JSReadableSt
             controller->m_pull.set(vm, controller, pullObject);
     }
 
+    // The strategy's highWaterMark is in bytes for a direct stream (it sizes the sink buffer);
+    // the same number is the backpressure threshold for a JS reader.
+    const bool hasHighWaterMark = stream->m_bunHighWaterMarkIsNumber && !std::isnan(highWaterMark) && highWaterMark > 0;
+    controller->m_highWaterMark = hasHighWaterMark ? highWaterMark : defaultDirectHighWaterMark;
+
     switch (sinkKind) {
     case DirectSinkKind::ArrayBuffer: {
         JSObject* sinkConstructor = zigGlobalObject->ArrayBufferSink();
@@ -1004,8 +1057,8 @@ void setUpDirectStreamController(JSC::JSGlobalObject* globalObject, JSReadableSt
         RETURN_IF_EXCEPTION(scope, );
         controller->m_arrayBufferSink.set(vm, controller, sink);
         JSObject* options = constructEmptyObject(globalObject);
-        // Forwarded iff the raw strategy highWaterMark is a non-zero, non-NaN number.
-        if (stream->m_bunHighWaterMarkIsNumber && highWaterMark != 0 && !std::isnan(highWaterMark))
+        // Forwarded iff the raw strategy highWaterMark is a positive number.
+        if (hasHighWaterMark)
             options->putDirect(vm, builtinNames(vm).highWaterMarkPublicName(), jsNumber(highWaterMark), 0);
         options->putDirect(vm, builtinNames(vm).streamPublicName(), jsBoolean(true), 0);
         options->putDirect(vm, builtinNames(vm).asUint8ArrayPublicName(), jsBoolean(true), 0);

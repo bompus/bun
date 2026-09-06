@@ -411,6 +411,20 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_onAsyncIterableSourceErrorSwallowed
     return JSValue::encode(jsUndefined());
 }
 
+// context = the reason cancel() threw into the iterator. The iterator letting that reason
+// propagate is the normal outcome of a cancel, not a failure of it: the cancel resolves.
+// Anything else thrown while unwinding (a throwing `finally`) still rejects it.
+JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_onAsyncIterableSourceCancelRejected, (JSGlobalObject * globalObject, CallFrame* callFrame))
+{
+    auto& vm = getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    JSValue rejection = callFrame->argument(0);
+    if (rejection == callFrame->argument(1))
+        return JSValue::encode(jsUndefined());
+    throwException(globalObject, scope, rejection);
+    return {};
+}
+
 // -- [bound-convention] direct-source methods: (opCell, ...callArgs) --
 
 // pull(controller): one drive of the iterator runs at a time; every pull while it runs gets
@@ -460,6 +474,14 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundAsyncIterableSourceCancel, (JS
     if (reason.toBoolean(globalObject)) {
         args.append(reason);
         result = invokeOptionalMethod(globalObject, iterator, vm.propertyNames->throwKeyword, args);
+        RETURN_IF_EXCEPTION(scope, {});
+        if (auto* thrownPromise = asPromise(result)) {
+            auto* settled = JSPromise::create(vm, globalObject->promiseStructure());
+            auto* runtime = JSStreamsRuntime::from(globalObject);
+            thrownPromise->performPromiseThenWithContext(vm, globalObject, runtime->onReturnUndefined(), runtime->onAsyncIterableSourceCancelRejected(), settled, reason);
+            RETURN_IF_EXCEPTION(scope, {});
+            return JSValue::encode(settled);
+        }
     } else
         result = invokeOptionalMethod(globalObject, iterator, vm.propertyNames->returnKeyword, args);
     RETURN_IF_EXCEPTION(scope, {});

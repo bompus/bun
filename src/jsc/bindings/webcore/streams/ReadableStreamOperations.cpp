@@ -385,6 +385,26 @@ void readableStreamError(JSGlobalObject* globalObject, JSReadableStream* stream,
     RELEASE_AND_RETURN(scope, readableStreamBYOBReaderErrorReadIntoRequests(globalObject, static_cast<JSReadableStreamBYOBReader*>(reader), error));
 }
 
+// The [[cancelAlgorithm]] of a `type: "direct"` source: its optional cancel(reason) hook, run in
+// the stream's async context like the spec controllers' hooks. readableStreamCancel clears the
+// source barriers (and with them the context snapshot) only after this returns.
+static JSPromise* cancelDirectUnderlyingSource(JSGlobalObject* globalObject, JSReadableStream* stream, JSObject* underlyingSource, JSValue reason)
+{
+    auto& vm = getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    if (!underlyingSource)
+        RELEASE_AND_RETURN(scope, promiseFulfilledWith(globalObject, JSC::jsUndefined()));
+    JSValue cancelFunction = underlyingSource->get(globalObject, builtinNames(vm).cancelPublicName());
+    RETURN_IF_EXCEPTION(scope, nullptr);
+    JSObject* cancelObject = cancelFunction.isCallable() ? cancelFunction.getObject() : nullptr;
+    if (!cancelObject)
+        RELEASE_AND_RETURN(scope, promiseFulfilledWith(globalObject, JSC::jsUndefined()));
+    MarkedArgumentBuffer args;
+    args.append(reason);
+    StreamAsyncContextScope asyncContextScope(globalObject, stream);
+    RELEASE_AND_RETURN(scope, invokeCallbackReturningPromise(globalObject, cancelObject, underlyingSource, args));
+}
+
 // ReadableStreamCancel(stream, reason)
 JSPromise* readableStreamCancel(JSGlobalObject* globalObject, JSReadableStream* stream, JSValue reason)
 {
@@ -419,7 +439,12 @@ JSPromise* readableStreamCancel(JSGlobalObject* globalObject, JSReadableStream* 
     case ControllerKind::None:
         if (stream->m_bunMode == BunStreamMode::NativePending)
             sourceCancelPromise = cancelPendingNativeSource(globalObject, stream, reason);
-        else {
+        else if (stream->m_bunMode == BunStreamMode::DirectPending) {
+            // Never pulled, but the source can still hold something to release (an async
+            // iterable body already holds its iterator).
+            stream->m_bunMode = BunStreamMode::Default;
+            sourceCancelPromise = cancelDirectUnderlyingSource(globalObject, stream, stream->m_directUnderlyingSource.get(), reason);
+        } else {
             stream->m_bunMode = BunStreamMode::Default;
             sourceCancelPromise = promiseFulfilledWith(globalObject, JSC::jsUndefined());
         }
@@ -445,8 +470,13 @@ JSPromise* readableStreamCancel(JSGlobalObject* globalObject, JSReadableStream* 
             RETURN_IF_EXCEPTION(scope, nullptr);
         }
         controller->m_closed = true;
+        // A producer parked on `await controller.write()` wakes with false, like a native sink.
+        controller->settleWritePending(globalObject, jsBoolean(false));
+        RETURN_IF_EXCEPTION(scope, nullptr);
+        // Null once the controller closed or errored: the source already saw close(reason).
+        JSObject* underlyingSource = controller->m_underlyingSource.get();
+        sourceCancelPromise = cancelDirectUnderlyingSource(globalObject, stream, underlyingSource, reason);
         directStreamControllerClearSource(controller);
-        sourceCancelPromise = promiseFulfilledWith(globalObject, JSC::jsUndefined());
         break;
     }
     case ControllerKind::NativeSink: {
