@@ -89,18 +89,21 @@ export async function run(cmd: string[]): Promise<string> {
 }
 
 /**
- * functrace.c plus a watchdog: counts traps, and on SIGALRM (armed at load)
- * or SIGUSR1 writes the tracer's state and the interrupted context to
- * $BUN_FUNCTRACE_DIAG. The tracer logic itself is untouched.
+ * functrace.c plus a watchdog: counts traps, reports a trap that fires again at
+ * an address whose breakpoint was already restored (which would spin forever),
+ * and on SIGALRM (armed at load) or SIGUSR1 writes the tracer's state and the
+ * interrupted context to $BUN_FUNCTRACE_DIAG. The tracer logic is untouched.
  */
 export function probeTracerSource(stock: string): string {
   const hook = "static void on_trap(int sig, siginfo_t *si, void *uc)\n{\n    (void)si;";
   if (!stock.includes(hook)) throw new Error("functrace.c changed shape; update the probe hook");
-  const patched = stock.replace(
+  let patched = stock.replace(
     hook,
     [
       "static volatile unsigned long diag_traps = 0;",
+      "static volatile unsigned long diag_repeats = 0;",
       "static volatile uintptr_t diag_last_pc = 0;",
+      "static void diag_report_repeat(uintptr_t at, size_t i);",
       "static void on_trap(int sig, siginfo_t *si, void *uc)",
       "{",
       "    (void)si;",
@@ -110,6 +113,22 @@ export function probeTracerSource(stock: string): string {
       "#elif defined(__linux__)",
       "    diag_last_pc = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.pc;",
       "#endif",
+    ].join("\n"),
+  );
+
+  // A trap at a start whose breakpoint was already restored means the write or
+  // the icache maintenance did not take: the handler restores it again and
+  // returns to the same address, which traps again. Count it and say so.
+  const record = "    if (__atomic_exchange_n(&seen[i], 1, __ATOMIC_RELAXED) == 0) {";
+  if (!patched.includes(record)) throw new Error("functrace.c changed shape; update the repeat probe");
+  patched = patched.replace(
+    record,
+    [
+      "    if (__atomic_load_n(&seen[i], __ATOMIC_RELAXED) != 0) {",
+      "        __atomic_fetch_add(&diag_repeats, 1, __ATOMIC_RELAXED);",
+      "        diag_report_repeat(at, i);",
+      "    }",
+      record,
     ].join("\n"),
   );
   return patched + "\n" + diagTail;
@@ -145,6 +164,23 @@ static void diag_copy_file(int fd, const char *path, size_t max)
     close(in);
 }
 
+// A breakpoint that fires again after its restore: the 16 first ones say where,
+// with the instruction as seen through both mappings.
+static void diag_report_repeat(uintptr_t at, size_t i)
+{
+    if (!diag_path[0] || __atomic_load_n(&diag_repeats, __ATOMIC_RELAXED) > 16) return;
+    int fd = open(diag_path, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    int r = region_of(at);
+    insn_t rx = *(const insn_t *)at;
+    insn_t rw = r >= 0 ? *(const insn_t *)(regions[r].rw + (at - regions[r].start)) : 0;
+    diag_write(fd, "REPEAT trap pid %d at %#lx (-slide %#lx) start[%zu] traps=%lu repeats=%lu orig=%#lx rx=%#lx rw=%#lx breakpoint=%#lx\n",
+               (int)getpid(), (unsigned long)at, (unsigned long)(at - slide), i, (unsigned long)diag_traps,
+               (unsigned long)diag_repeats, originals ? (unsigned long)originals[i] : 0ul, (unsigned long)rx,
+               (unsigned long)rw, (unsigned long)BREAKPOINT);
+    close(fd);
+}
+
 static void diag_dump(int sig, siginfo_t *si, void *uc)
 {
     (void)si;
@@ -160,8 +196,8 @@ static void diag_dump(int sig, siginfo_t *si, void *uc)
 #else
     uintptr_t pc = 0, sp = 0, lr = 0;
 #endif
-    diag_write(fd, "=== diag signal %d pid %d t=%ld.%03ld armed=%d traps=%lu last_trap_pc=%#lx (-slide %#lx) entries=%lu start_count=%zu regions=%d slide=%#lx\n",
-               sig, (int)getpid(), (long)ts.tv_sec, ts.tv_nsec / 1000000, armed, (unsigned long)diag_traps,
+    diag_write(fd, "=== diag signal %d pid %d t=%ld.%03ld armed=%d traps=%lu repeats=%lu last_trap_pc=%#lx (-slide %#lx) entries=%lu start_count=%zu regions=%d slide=%#lx\n",
+               sig, (int)getpid(), (long)ts.tv_sec, ts.tv_nsec / 1000000, armed, (unsigned long)diag_traps, (unsigned long)diag_repeats,
                (unsigned long)diag_last_pc, (unsigned long)(diag_last_pc ? diag_last_pc - slide : 0),
                record ? (unsigned long)record[4] : 0ul, start_count, region_count, (unsigned long)slide);
     diag_write(fd, "pc=%#lx (-slide %#lx, region %d) sp=%#lx lr=%#lx (-slide %#lx)\n", (unsigned long)pc,
@@ -221,10 +257,23 @@ __attribute__((constructor(102))) static void diag_init(void)
 #endif
     const char *secs = getenv("BUN_FUNCTRACE_DIAG_ALARM");
     alarm(secs ? (unsigned)atoi(secs) : 20);
+    // Every run appends to one file in the stress phases, so the per-run line is opt-in.
+    if (!getenv("BUN_FUNCTRACE_DIAG_VERBOSE")) return;
     int fd = open(diag_path, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
     if (fd >= 0) {
         diag_write(fd, "loaded pid %d armed=%d start_count=%zu regions=%d slide=%#lx\n", (int)getpid(), armed, start_count, region_count, (unsigned long)slide);
         close(fd);
     }
+}
+
+__attribute__((destructor)) static void diag_exit(void)
+{
+    unsigned long repeats = __atomic_load_n(&diag_repeats, __ATOMIC_RELAXED);
+    if (!diag_path[0] || (!repeats && !getenv("BUN_FUNCTRACE_DIAG_VERBOSE"))) return;
+    int fd = open(diag_path, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    diag_write(fd, "EXIT pid %d traps=%lu repeats=%lu entries=%lu\n", (int)getpid(), (unsigned long)diag_traps, repeats,
+               record ? (unsigned long)record[4] : 0ul);
+    close(fd);
 }
 `;

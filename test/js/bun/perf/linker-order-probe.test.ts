@@ -131,9 +131,8 @@ describe.skipIf(!canProbe)("function tracer hang probe", () => {
   type Outcome = { ok: boolean; hang: boolean; detail: string };
 
   /** One traced run, the way linker-order.test.ts spawns it, with a watchdog instead of the test timeout. */
-  async function tracedRun(tag: string, hangAfterMs: number): Promise<Outcome> {
+  async function tracedRun(tag: string, hangAfterMs: number, diag = join(root, `diag.${tag}.txt`)): Promise<Outcome> {
     const trace = join(root, `trace.${tag}.bin`);
-    const diag = join(root, `diag.${tag}.txt`);
     const started = performance.now();
     await using proc = Bun.spawn({
       cmd: [fixture, child],
@@ -204,7 +203,23 @@ describe.skipIf(!canProbe)("function tracer hang probe", () => {
     return { ok: false, hang: true, detail };
   }
 
+  /**
+   * A breakpoint that fires again after the tracer restored it would spin
+   * forever, which is one shape the CI hang could take. The probe tracer counts
+   * those and names the first ones (REPEAT lines).
+   */
+  function repeatsIn(diag: string): { repeats: number; lines: string[] } {
+    if (!existsSync(diag)) return { repeats: 0, lines: [] };
+    const text = readFileSync(diag, "utf8").split("\n");
+    const lines = text.filter(line => line.startsWith("REPEAT") || line.startsWith("EXIT"));
+    const repeats = text
+      .filter(line => line.startsWith("EXIT"))
+      .reduce((sum, line) => sum + Number(/repeats=(\d+)/.exec(line)?.[1] ?? 0), 0);
+    return { repeats, lines: lines.slice(0, 20) };
+  }
+
   async function phase(label: string, iterations: number, concurrency: number, hangAfterMs: number) {
+    const diag = join(root, `diag.${label}.txt`);
     let hangs = 0,
       fails = 0,
       runs = 0;
@@ -213,7 +228,7 @@ describe.skipIf(!canProbe)("function tracer hang probe", () => {
     await Promise.all(
       Array.from({ length: concurrency }, async (_, worker) => {
         for (let i = 0; i < iterations && hangs < 3; i++) {
-          const outcome = await tracedRun(`${label}.${worker}.${i}`, hangAfterMs);
+          const outcome = await tracedRun(`${label}.${worker}.${i}`, hangAfterMs, diag);
           runs++;
           if (outcome.hang) hangs++;
           else if (!outcome.ok) {
@@ -223,16 +238,17 @@ describe.skipIf(!canProbe)("function tracer hang probe", () => {
         }
       }),
     );
+    const { repeats, lines } = repeatsIn(diag);
     console.log(
-      `phase ${label}: ${runs} runs, ${hangs} hung, ${fails} failed, ${((performance.now() - t0) / 1000).toFixed(1)} s`,
+      `phase ${label}: ${runs} runs, ${hangs} hung, ${fails} failed, ${repeats} repeat traps, ${((performance.now() - t0) / 1000).toFixed(1)} s`,
     );
-    for (const f of failures) console.log(f);
-    return { hangs, fails };
+    for (const f of [...failures, ...lines]) console.log(f);
+    return { hangs, fails, repeats };
   }
 
   test("traced fixture, idle machine", async () => {
-    const { hangs, fails } = await phase("idle", 150, 4, 30_000);
-    expect({ hangs, fails }).toEqual({ hangs: 0, fails: 0 });
+    const { hangs, fails, repeats } = await phase("idle", 150, 4, 30_000);
+    expect({ hangs, fails, repeats }).toEqual({ hangs: 0, fails: 0, repeats: 0 });
   }, 300_000);
 
   test("traced fixture, under cpu and spawn load", async () => {
@@ -245,38 +261,106 @@ describe.skipIf(!canProbe)("function tracer hang probe", () => {
       }),
     );
     try {
-      const { hangs, fails } = await phase("load", 300, 6, 30_000);
-      expect({ hangs, fails }).toEqual({ hangs: 0, fails: 0 });
+      const { hangs, fails, repeats } = await phase("load", 300, 6, 30_000);
+      expect({ hangs, fails, repeats }).toEqual({ hangs: 0, fails: 0, repeats: 0 });
     } finally {
       for (const hog of hogs) hog.kill("SIGKILL");
       await Promise.all(hogs.map(hog => hog.exited));
     }
   }, 600_000);
 
-  // The real file, the way the CI batch runs it: a --parallel worker, next to
-  // files that spawn and serve. linker-order.test.ts carries its own watchdog
-  // output for the tracer test (see functrace-probe-helpers.ts).
-  test("linker-order.test.ts inside a --parallel batch", async () => {
-    const neighbors = [
-      "test/js/bun/perf/linker-order.test.ts",
-      "test/js/bun/util/filesink.test.ts",
-      "test/internal/fifo.test.ts",
-      "test/js/bun/spawn/spawn.ipc.test.ts",
-      "test/cli/run/self-reference.test.ts",
-      "test/js/bun/shell/pipeline_stack.test.ts",
-      "test/js/bun/http/bun-serve-html.test.ts",
-      "test/js/bun/test/bun_test.test.ts",
-      "test/js/web/websocket/websocket-pause.test.ts",
-      "test/regression/issue/09555.test.ts",
-      "test/cli/heap-prof.test.ts",
-      "test/bundler/bundler_loader.test.ts",
-    ];
+  // The parallel batch of the shard that hung (build 111536, debian 13 aarch64),
+  // file for file, minus the two napi files whose prebuilds the runner makes.
+  // linker-order.test.ts carries its own watchdog for the tracer test.
+  const BATCH = `
+test/bundler/bundler_browser.test.ts
+test/bundler/bundler_loader.test.ts
+test/bundler/css/wpt/color-computed.test.ts
+test/bundler/resolver/cache-node-compat.test.ts
+test/cli/heap-prof.test.ts
+test/cli/install/migration/pnpm-migration-complete.test.ts
+test/cli/run/crash-report-command-char.test.ts
+test/cli/run/scoped-debug-log.test.ts
+test/cli/run/self-reference.test.ts
+test/internal/fifo.test.ts
+test/internal/rust-windows-sys-link.test.ts
+test/js/bun/glob/match.test.ts
+test/js/bun/http/bun-serve-html-manifest.test.ts
+test/js/bun/http/bun-serve-html.test.ts
+test/js/bun/http/bun-serve-ssl.test.ts
+test/js/bun/http/form-data-set-append.test.js
+test/js/bun/perf/linker-order.test.ts
+test/js/bun/resolve/esModule.test.ts
+test/js/bun/resolve/require-esm-evaluating-cycle.test.ts
+test/js/bun/shell/env.positionals.test.ts
+test/js/bun/shell/pipeline_stack.test.ts
+test/js/bun/spawn/spawn.ipc.test.ts
+test/js/bun/symbols.test.ts
+test/js/bun/test/bun_test.test.ts
+test/js/bun/test/fake-timers/sinonjs/fake-timers.test.ts
+test/js/bun/test/fake-timers/sinonjs/issue-276.test.ts
+test/js/bun/test/mock-disposable.test.ts
+test/js/bun/test/mock/6874/B.test.ts
+test/js/bun/test/test-failing.test.ts
+test/js/bun/util/filesink.test.ts
+test/js/bun/util/fuzzy-wuzzy.test.ts
+test/js/bun/util/pathToFileURL-invalid.test.ts
+test/js/bun/webview/webview-chrome-disconnect.test.ts
+test/js/bun/webview/webview.test.ts
+test/js/node/async_hooks/async-local-storage-thenable.test.ts
+test/js/node/crypto/sign-jwk-ieee-p1363.test.ts
+test/js/node/http/node-http-req-socket-pause.test.ts
+test/js/node/http/node-http.compress.leak.test.ts
+test/js/node/stream/node-stream-uint8array.test.ts
+test/js/node/tls/node-tls-duplex-close-throw-uaf.test.ts
+test/js/node/url/url-parse-invalid-input.test.js
+test/js/node/zlib/zlib-estimated-size-gc.test.ts
+test/js/sql/sql-helpers-validation.test.ts
+test/js/sql/sqlite-sql.test.ts
+test/js/third_party/body-parser/express-bun-build-compile.test.ts
+test/js/third_party/express/res.json.test.ts
+test/js/third_party/grpc-js/test-certificate-provider.test.ts
+test/js/third_party/grpc-js/test-local-subchannel-pool.test.ts
+test/js/third_party/grpc-js/test-metadata.test.ts
+test/js/third_party/http2-wrapper/http2-wrapper.test.ts
+test/js/third_party/remix/remix.test.ts
+test/js/third_party/rollup-v4/rollup-v4.test.ts
+test/js/third_party/wpt-h2/run.test.ts
+test/js/web/fetch/headers-case.test.ts
+test/js/web/streams/readable-stream-blob-consumed.test.ts
+test/js/web/streams/transform-stream-leak.test.ts
+test/js/web/websocket/websocket-pause.test.ts
+test/js/web/workers/worker-postmessage-transfer.test.ts
+test/regression/issue/03091.test.ts
+test/regression/issue/05828.test.ts
+test/regression/issue/06946/06946.test.ts
+test/regression/issue/09555.test.ts
+test/regression/issue/17244.test.ts
+test/regression/issue/17405.test.ts
+test/regression/issue/22243.test.ts
+test/regression/issue/23139.test.ts
+test/regression/issue/24234.test.ts
+test/regression/issue/25622.test.ts
+test/regression/issue/25628.test.ts
+test/regression/issue/25716.test.ts
+test/regression/issue/26377.test.ts
+test/regression/issue/28159.test.ts
+test/regression/issue/2993.test.ts
+test/regression/issue/32728.test.ts
+test/regression/issue/css-system-color-mix-crash.test.ts
+test/regression/issue/issue-1825-jest-mock-functions.test.ts
+`
+    .trim()
+    .split("\n");
+
+  test("linker-order.test.ts inside the parallel batch that hung", async () => {
     const repo = join(import.meta.dir, "../../../..");
+    const rounds = process.arch === "arm64" ? 6 : 2;
     let timedOut = 0;
     const t0 = performance.now();
-    for (let i = 0; i < 12 && timedOut < 2; i++) {
+    for (let i = 0; i < rounds && timedOut < 2; i++) {
       await using proc = Bun.spawn({
-        cmd: [bunExe(), "test", "--parallel=3", "--timeout=70000", "--dots", ...neighbors],
+        cmd: [bunExe(), "test", "--parallel=3", "--timeout=70000", "--dots", ...BATCH],
         cwd: repo,
         env: { ...bunEnv, BUN_FUNCTRACE_PROBE: "1" },
         stdout: "pipe",
@@ -285,22 +369,22 @@ describe.skipIf(!canProbe)("function tracer hang probe", () => {
       const [stdout, stderr] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
       const out = stdout + stderr;
       const summary = /Ran \d+ tests across \d+ files\. \[[^\]]+\]/.exec(out)?.[0] ?? `exit ${proc.exitCode}`;
-      const tracerLine = out.split("\n").find(line => line.includes("functrace steps:")) ?? "<no steps line>";
-      console.log(`batch ${i}: ${summary} ${tracerLine.trim()}`);
-      if (/timed out|HUNG|functrace watchdog/.test(out) && /linker-order|functrace/.test(out)) {
+      const steps = out.split("\n").find(line => line.includes("functrace steps:")) ?? "<no steps line>";
+      console.log(`batch ${i}: ${summary} ${steps.trim()}`);
+      if (/timed out|HUNG|functrace watchdog|REPEAT trap/.test(out)) {
         timedOut++;
         console.error(
           `=== batch ${i} output (filtered)\n${out
             .split("\n")
-            .filter(line => !/^\.+$/.test(line.trim()))
-            .slice(-400)
+            .filter(line => !/^[.\s]*$/.test(line))
+            .slice(-500)
             .join("\n")}`,
         );
       }
     }
     console.log(`batches: ${((performance.now() - t0) / 1000).toFixed(1)} s, ${timedOut} with a tracer timeout`);
     expect(timedOut).toBe(0);
-  }, 1_500_000);
+  }, 1_800_000);
 
   test("cleanup", () => {
     dirHandle?.[Symbol.dispose]?.();
