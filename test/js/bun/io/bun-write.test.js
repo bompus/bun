@@ -1141,6 +1141,129 @@ int posix_fadvise(int fd, off_t offset, off_t len, int advice) {
         Bun.write(join(String(dir), "missing", "c"), await fetch(server.url), { createPath: false }),
       ).rejects.toThrow(expect.objectContaining({ code: "ENOENT" }));
     });
+
+    // A `type: "direct"` body (an async generator body is one) settles its pump without
+    // `controller.close()`: when `pull()` rejects, and when it resolves without closing. Bun.write
+    // then has to detach the controller and end the file sink itself. It used to free the sink with
+    // the controller still pointing at it, so the controller's collection (or a late write through
+    // it) touched freed memory, and bytes still buffered in the sink never reached the file.
+    describe("a direct body that settles without closing the sink", () => {
+      async function run(script) {
+        using dir = tempDir("bun-write-direct-body", {});
+        await using proc = Bun.spawn({
+          cmd: [bunExe(), "-e", script],
+          env: bunEnv,
+          cwd: String(dir),
+          stdout: "pipe",
+          stderr: "inherit",
+        });
+        const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+        return { stdout, exitCode };
+      }
+      const tick = `await new Promise(resolve => setImmediate(resolve))`;
+
+      it("an async generator that throws after a yield, then a collection", async () => {
+        const { stdout, exitCode } = await run(`
+          const fs = require("fs");
+          const body = async function* () { yield "first"; ${tick}; throw new Error("boom"); };
+          for (let i = 0; i < 3; i++) {
+            const result = await Bun.write("out.txt", new Response(body)).then(n => n, e => e.message);
+            Bun.gc(true);
+            console.log(result, JSON.stringify(fs.readFileSync("out.txt", "utf8")));
+          }
+        `);
+        expect(stdout).toBe(`boom "first"\n`.repeat(3));
+        expect(exitCode).toBe(0);
+      });
+
+      it("a pull() that rejects before Bun.write returns, then a collection", async () => {
+        const { stdout, exitCode } = await run(`
+          const body = () => new ReadableStream({ type: "direct", async pull() { throw new Error("boom"); } });
+          for (let i = 0; i < 3; i++) {
+            const source = i % 2 ? new Response(body()) : new Request("http://a/", { method: "POST", body: body() });
+            console.log(await Bun.write("out.txt", source).then(n => n, e => e.message));
+            Bun.gc(true);
+          }
+        `);
+        expect(stdout).toBe(`boom\n`.repeat(3));
+        expect(exitCode).toBe(0);
+      });
+
+      it("a throw right after a yield, an event-loop turn, then a collection", async () => {
+        // The turn runs the sink's queued flush task, which held the last reference before.
+        const { stdout, exitCode } = await run(`
+          const fs = require("fs");
+          const body = async function* () { yield "first"; throw new Error("boom"); };
+          for (let i = 0; i < 5; i++) {
+            const result = await Bun.write("out.txt", new Response(body)).then(n => n, e => e.message);
+            ${tick};
+            Bun.gc(true);
+            console.log(result, JSON.stringify(fs.readFileSync("out.txt", "utf8")));
+          }
+        `);
+        expect(stdout).toBe(`boom "first"\n`.repeat(5));
+        expect(exitCode).toBe(0);
+      });
+
+      it("a pull() that resolves without close(): buffered bytes reach the file, a late write throws", async () => {
+        const { stdout, exitCode } = await run(`
+          const fs = require("fs");
+          let controller;
+          const body = new ReadableStream({
+            type: "direct",
+            async pull(c) {
+              controller = c;
+              c.write("first");
+              ${tick};
+              c.write("second");
+            },
+          });
+          const written = await Bun.write("out.txt", new Response(body));
+          let late;
+          try {
+            controller.write("late");
+            late = "wrote";
+          } catch (e) {
+            late = e.message.split(".")[0];
+          }
+          Bun.gc(true);
+          console.log(written, JSON.stringify(fs.readFileSync("out.txt", "utf8")), late);
+        `);
+        expect(stdout).toBe(`11 "firstsecond" This FileSink has already been closed\n`);
+        expect(exitCode).toBe(0);
+      });
+
+      it("inside a Worker that then goes away", async () => {
+        // Tearing the Worker's heap down sweeps the controller cells with no gc() call anywhere.
+        const { stdout, exitCode } = await run(`
+          const { Worker } = require("node:worker_threads");
+          const source = \`
+            const { parentPort } = require("node:worker_threads");
+            (async () => {
+              const failing = async function* () { yield "first"; ${tick}; throw new Error("boom"); };
+              const open = new ReadableStream({ type: "direct", async pull(c) { c.write("first"); await c.flush(); } });
+              const results = [
+                await Bun.write("gen.txt", new Response(failing)).then(n => n, e => e.message),
+                await Bun.write("direct.txt", new Response(open)).then(n => n, e => e.message),
+              ];
+              parentPort.postMessage(results.join());
+              setInterval(() => {}, 1000);
+            })();
+          \`;
+          for (let i = 0; i < 3; i++) {
+            const worker = new Worker(source, { eval: true });
+            const [message] = await new Promise((resolve, reject) => {
+              worker.once("message", (...args) => resolve(args));
+              worker.once("error", reject);
+            });
+            await worker.terminate();
+            console.log(message);
+          }
+        `);
+        expect(stdout).toBe(`boom,5\n`.repeat(3));
+        expect(exitCode).toBe(0);
+      });
+    });
   });
 
   it("BunFile.name survives concurrent write() calls + GC", async () => {

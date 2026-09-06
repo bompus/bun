@@ -1595,6 +1595,23 @@ fn on_reject_stream(global_this: &JSGlobalObject, callframe: &CallFrame) -> JsRe
 }
 
 impl FileSink {
+    /// `Bun.write(file, stream)`: the JS pump that `JSSink::assign_to_stream` started on this sink
+    /// has settled. A `type: "direct"` source (an async-iterator body is one) settles its pull
+    /// promise without closing the controller, and the controller cell only borrows the sink. Detach
+    /// it, so that neither a later `controller.write()` nor the cell's destructor reaches a sink its
+    /// owner has released, then flush and close the file as `controller.end()` does.
+    pub(crate) fn end_js_stream(&self, global_this: &JSGlobalObject) -> sys::Result<()> {
+        if let streams::SourceHandle::JSController(controller) =
+            self.source.replace(streams::SourceHandle::None)
+        {
+            // `detach()` also runs the pump's onClose, which calls the source's `cancel()`.
+            crate::dispatch::fold(bun_jsc::call_check_slow(global_this, || {
+                streams::controller_abi::detach_ptr(controller)
+            }));
+        }
+        self.end(None)
+    }
+
     /// `Bun.write(file, stream)`: wire `stream`'s native source straight to this sink and return a
     /// promise for the byte count once the file is closed. `None` if the stream is not a native
     /// source; the caller falls back to the JS pump.
@@ -1691,9 +1708,12 @@ impl FileSink {
         }
 
         // No per-wrapper +1 for the controller (only the transient `_guard`
-        // above): the JS builtins always call `controller.end()`/`.close()`
-        // (`${controller}__end/close` → `controller->detach()` → m_sinkPtr=null)
-        // before GC, so the controller's dtor never reaches `finalize`.
+        // above), so it must detach (m_sinkPtr=null) before the last ref
+        // drops, or its dtor reaches `finalize`. The generic pump always calls
+        // `controller.end()`/`.close()`. A `type: "direct"` source can settle
+        // without either; then the `writer.close()` in
+        // `handle_{resolve,reject}_stream` detaches it (`on_close` →
+        // `source.close()` → `controller.end()`).
         let promise_result = JSSink::assign_to_stream(
             global_this,
             stream.value,

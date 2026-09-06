@@ -1590,7 +1590,10 @@ impl BlobExt for Blob {
 
         assignment_result.ensure_still_alive();
 
+        // Every return below but the pending one releases `file_sink`, so it
+        // ends the JS pump first (`end_js_stream`).
         if let Some(err) = assignment_result.to_error() {
+            let _ = file_sink.end_js_stream(global_this);
             return Ok(
                 JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
                     global_this,
@@ -1627,14 +1630,10 @@ impl BlobExt for Blob {
                         return Ok(promise_value);
                     }
                     jsc::js_promise::Status::Fulfilled => {
-                        let written = file_sink.stream_bytes.get().unwrap_or(0);
                         readable_stream.done();
-                        return Ok(JSPromise::resolved_promise_value(
-                            global_this,
-                            JSValue::js_number(written as f64),
-                        ));
                     }
                     jsc::js_promise::Status::Rejected => {
+                        let _ = file_sink.end_js_stream(global_this);
                         readable_stream.cancel(global_this)?;
                         promise.set_handled(global_this.vm());
                         return Ok(JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
@@ -1644,6 +1643,7 @@ impl BlobExt for Blob {
                     }
                 }
             } else {
+                let _ = file_sink.end_js_stream(global_this);
                 readable_stream.cancel(global_this)?;
                 return Ok(
                     JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
@@ -1653,12 +1653,16 @@ impl BlobExt for Blob {
                 );
             }
         }
-        let written = file_sink.stream_bytes.get().unwrap_or(0);
 
-        Ok(JSPromise::resolved_promise_value(
-            global_this,
-            JSValue::js_number(written as f64),
-        ))
+        Ok(match end_resolved_file_stream(&file_sink, global_this) {
+            Ok(written) => JSPromise::resolved_promise_value(global_this, written),
+            Err(err) => {
+                JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
+                    global_this,
+                    err,
+                )
+            }
+        })
     }
 
     fn get_writer(&self, global_this: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue> {
@@ -5776,6 +5780,20 @@ struct FileStreamWrapper {
     pub sink: RefPtr<webcore::FileSink>,
 }
 
+/// The JS pump into a `Bun.write` sink resolved. End it: the value to settle
+/// with is the byte count, or the error that kept accepted bytes from the file.
+fn end_resolved_file_stream(
+    sink: &webcore::FileSink,
+    global_this: &JSGlobalObject,
+) -> Result<JSValue, JSValue> {
+    match sink.end_js_stream(global_this) {
+        Ok(()) => Ok(JSValue::js_number(
+            sink.stream_bytes.get().unwrap_or(0) as f64,
+        )),
+        Err(err) => Err(err.to_js(global_this)),
+    }
+}
+
 pub(crate) fn on_file_stream_resolve_request_stream(
     global_this: &JSGlobalObject,
     callframe: &CallFrame,
@@ -5789,9 +5807,10 @@ pub(crate) fn on_file_stream_resolve_request_stream(
     if let Some(stream) = strong.get() {
         stream.done();
     }
-    let written = this.sink.stream_bytes.get().unwrap_or(0);
-    this.promise
-        .resolve(global_this, JSValue::js_number(written as f64))?;
+    match end_resolved_file_stream(&this.sink, global_this) {
+        Ok(written) => this.promise.resolve(global_this, written)?,
+        Err(err) => this.promise.reject(global_this, Ok(err))?,
+    }
     Ok(JSValue::UNDEFINED)
 }
 
@@ -5811,6 +5830,8 @@ pub(crate) fn on_file_stream_reject_request_stream(
 
     let strong = core::mem::take(&mut this.readable_stream_ref);
 
+    // The source's error wins over a flush error.
+    let _ = this.sink.end_js_stream(global_this);
     this.promise.reject(global_this, Ok(err))?;
 
     if let Some(stream) = strong.get() {
