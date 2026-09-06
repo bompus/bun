@@ -1007,6 +1007,16 @@ impl Watcher {
         None
     }
 
+    /// Whether `hash` names an entry that is in the watchlist and not queued
+    /// for eviction. Caller holds `self.mutex`.
+    pub fn is_watching(&self, hash: HashType) -> bool {
+        match self.index_of(hash) {
+            Some(index) => !self.evict_list[..self.evict_list_i as usize]
+                .contains(&(index as WatchItemIndex)),
+            None => false,
+        }
+    }
+
     // Const-generic
     // enum params need `adt_const_params` (nightly); the value is only
     // compared to `.Directory`, so a plain runtime parameter is fine.
