@@ -572,6 +572,29 @@ it("ReadableStream (direct): an underlyingSource close() hook that throws is not
   await expect(stream2.getReader().read()).rejects.toThrow("close hook threw");
 });
 
+// The hook's error fails the consumer even when pull() catches what close()/end() rethrows;
+// the body must not resolve with the partial bytes or stay pending.
+it.each(["text", "bytes", "arrayBuffer"])(
+  "ReadableStream (direct): a throwing close() hook that pull() swallows still fails %s()",
+  async method => {
+    for (const finish of ["close", "end"]) {
+      const stream = new ReadableStream({
+        type: "direct",
+        pull(controller) {
+          controller.write("hello");
+          try {
+            controller[finish]();
+          } catch {}
+        },
+        close() {
+          throw new Error("close hook threw");
+        },
+      });
+      await expect(new Response(stream)[method]()).rejects.toThrow("close hook threw");
+    }
+  },
+);
+
 it("ReadableStream (direct): controller.close() outside pull with a throwing close() hook settles the pending read and throws to the closer", async () => {
   let controller;
   const pulled = Promise.withResolvers();
