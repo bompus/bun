@@ -7,7 +7,7 @@ use crate::{JSGlobalObject, JSObject, JSValue, JsResult};
 /// Runtime flag set passed to [`JSPropertyIterator::init`].
 ///
 /// `Default` is `own_properties_only = true`,
-/// `observable = true`, `only_non_index_properties = false`.
+/// `observable = true`, `only_non_index_properties = false`, `include_symbols = true`.
 // Runtime flags (not const generics) because the branches gate per-property work, not a
 // hot inner loop, and the monomorphization fan-out would be 32 instantiations. Profile
 // if hot.
@@ -18,6 +18,9 @@ pub struct JSPropertyIteratorOptions {
     pub own_properties_only: bool,
     pub observable: bool,
     pub only_non_index_properties: bool,
+    /// When false, symbol-keyed properties are not visited (the `Object.keys` view). When
+    /// true, a symbol key is yielded under its description string.
+    pub include_symbols: bool,
 }
 
 impl JSPropertyIteratorOptions {
@@ -30,6 +33,7 @@ impl JSPropertyIteratorOptions {
             own_properties_only: true,
             observable: true,
             only_non_index_properties: false,
+            include_symbols: true,
         }
     }
 }
@@ -43,6 +47,7 @@ impl Default for JSPropertyIteratorOptions {
             own_properties_only: true,
             observable: true,
             only_non_index_properties: false,
+            include_symbols: true,
         }
     }
 }
@@ -142,6 +147,7 @@ impl<'a> JSPropertyIterator<'a> {
             &mut len,
             options.own_properties_only,
             options.only_non_index_properties,
+            options.include_symbols,
         )?;
         if cfg!(debug_assertions) {
             if len > 0 {
@@ -250,6 +256,7 @@ impl JSPropertyIteratorImpl {
         count: &mut usize,
         own_properties_only: bool,
         only_non_index_properties: bool,
+        include_symbols: bool,
     ) -> JsResult<Option<NonNull<JSPropertyIteratorImpl>>> {
         // may return null without an exception
         let raw = from_js_host_call_generic(global_object, || {
@@ -259,6 +266,7 @@ impl JSPropertyIteratorImpl {
                 count,
                 own_properties_only,
                 only_non_index_properties,
+                include_symbols,
             )
         })?;
         Ok(NonNull::new(raw))
@@ -311,6 +319,7 @@ unsafe extern "C" {
         count: &mut usize,
         own_properties_only: bool,
         only_non_index_properties: bool,
+        include_symbols: bool,
     ) -> *mut JSPropertyIteratorImpl;
     safe fn Bun__JSPropertyIterator__getNameAndValue(
         iter: &mut JSPropertyIteratorImpl,
