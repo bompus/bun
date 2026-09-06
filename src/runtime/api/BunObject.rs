@@ -1151,15 +1151,7 @@ fn resolve_sync(global_object: &JSGlobalObject, callframe: &CallFrame) -> JsResu
 fn resolve(global_object: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue> {
     let value = match do_resolve(global_object, callframe.arguments()) {
         Ok(v) => v,
-        Err(e) => {
-            let err = global_object.take_error(e);
-            return Ok(
-                JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                    global_object,
-                    err,
-                ),
-            );
-        }
+        Err(e) => return JSPromise::rejected_promise_from_exception(global_object, e),
     };
     Ok(JSPromise::resolved_promise_value(global_object, value))
 }

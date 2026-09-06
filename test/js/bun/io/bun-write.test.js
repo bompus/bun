@@ -1161,3 +1161,107 @@ int posix_fadvise(int fd, off_t offset, off_t len, int advice) {
     expect(f.name).toBe(filePath);
   });
 });
+
+// Bun.write() has a synchronous fast path for small string / typed-array
+// payloads and for sources that are already errored. A failure there produces
+// an already-rejected promise. That promise must be tracked like any other
+// rejection: the async path of the very same call (Blob source, large payload,
+// ENOENT + mkdir) already is, so whether an unhandled failure was reported used
+// to depend on the payload type and size.
+describe("fast-path failures are tracked like any other rejection", () => {
+  const cases = /* js */ `
+    const { join } = require("node:path");
+    const dir = process.cwd();
+    const used = new Response("abc");
+    await used.text();
+    const errored = () => new Response(new ReadableStream({ start(c) { c.error(new Error("stream-err")); } }));
+    const cases = {
+      stringToDirectory: () => Bun.write(join(dir, "adir"), "x"),
+      bunFileWrite: () => Bun.file(join(dir, "adir")).write("x"),
+      bytesToDirectory: () => Bun.write(join(dir, "adir"), new Uint8Array(8)),
+      belowAFile: () => Bun.write(join(dir, "file.txt", "sub"), "x"),
+      usedBody: () => Bun.write(join(dir, "o1"), used),
+      erroredBody: () => Bun.write(join(dir, "o2"), errored()),
+    };
+    const turn = () => new Promise(r => setImmediate(r));
+    // Some of these take the threadpool path on some platforms. Wait (without
+    // attaching a handler) until every promise settled, then one more turn:
+    // unhandledRejection is delivered at the end of the turn that rejected.
+    async function settled(promises) {
+      while (promises.some(p => Bun.peek.status(p) === "pending")) await turn();
+      await turn();
+      await turn();
+    }
+  `;
+  const caseNames = ["stringToDirectory", "bunFileWrite", "bytesToDirectory", "belowAFile", "usedBody", "erroredBody"];
+
+  async function run(script) {
+    using dir = tempDir("bun-write-unhandled", { "adir": { ".keep": "" }, "file.txt": "hi" });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", script],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  }
+
+  it("unhandledRejection receives (reason, promise), then rejectionHandled on a late catch", async () => {
+    const { stdout, stderr, exitCode } = await run(/* js */ `
+      ${cases}
+      const names = new Map();
+      const unhandled = [];
+      const handledLate = [];
+      process.on("unhandledRejection", (reason, promise) => {
+        unhandled.push(names.get(promise) + ":" + (reason?.code ?? reason?.message));
+      });
+      process.on("rejectionHandled", promise => handledLate.push(names.get(promise) + ":" + unhandled.length));
+      for (const [name, make] of Object.entries(cases)) names.set(make(), name);
+      await settled([...names.keys()]);
+      for (const promise of names.keys()) promise.catch(() => {});
+      await turn();
+      await turn();
+      console.log(JSON.stringify({ unhandled, handledLate }));
+    `);
+    expect(stderr).toBe("");
+    const { unhandled, handledLate } = JSON.parse(stdout);
+    // Which errno a directory / non-directory path produces differs per
+    // platform; what matters is that every rejection was reported once, with
+    // the promise that was returned.
+    expect(unhandled.map(entry => entry.split(":")[0]).sort()).toEqual([...caseNames].sort());
+    expect(unhandled).toContain("usedBody:ERR_BODY_ALREADY_USED");
+    expect(unhandled).toContain("erroredBody:stream-err");
+    // Every rejectionHandled came after all of the unhandledRejection events.
+    expect(handledLate).toEqual(caseNames.map(name => name + ":" + caseNames.length));
+    expect(exitCode).toBe(0);
+  });
+
+  it("with no listener the rejection is printed and the exit code is 1", async () => {
+    const { stderr, exitCode } = await run(/* js */ `
+      const used = new Response("abc");
+      await used.text();
+      Bun.write("out.txt", used);
+    `);
+    expect(stderr).toContain("ERR_BODY_ALREADY_USED");
+    expect(exitCode).toBe(1);
+  });
+
+  it("a rejection handled in the same tick is not reported and emits no rejectionHandled", async () => {
+    const { stdout, stderr, exitCode } = await run(/* js */ `
+      ${cases}
+      const events = [];
+      process.on("unhandledRejection", (reason, promise) => events.push("unhandledRejection"));
+      process.on("rejectionHandled", promise => events.push("rejectionHandled"));
+      const reasons = [];
+      const promises = Object.values(cases).map(make => make());
+      for (const promise of promises) promise.catch(e => reasons.push(e?.code ?? e?.message));
+      await settled(promises);
+      console.log(JSON.stringify({ events, rejected: reasons.length }));
+    `);
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toEqual({ events: [], rejected: caseNames.length });
+    expect(exitCode).toBe(0);
+  });
+});

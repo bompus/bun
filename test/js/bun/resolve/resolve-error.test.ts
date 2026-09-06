@@ -283,3 +283,53 @@ describe.concurrent("tsconfig paths wildcard with overlapping prefix/suffix", ()
     await run("xy*xy", "xy");
   });
 });
+
+describe("Bun.resolve", () => {
+  // Bun.resolve() resolves synchronously and hands back an already-settled
+  // promise. A failure must be tracked like any other rejection.
+  it("an unhandled rejection is reported, and a late catch emits rejectionHandled after it", async () => {
+    using dir = tempDir("bun-resolve-unhandled", { "index.js": "" });
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        /* js */ `
+          const events = [];
+          let returned;
+          process.on("unhandledRejection", (reason, promise) => events.push("unhandledRejection:" + (promise === returned) + ":" + reason?.code));
+          process.on("rejectionHandled", promise => events.push("rejectionHandled:" + (promise === returned)));
+          returned = Bun.resolve("./does-not-exist", process.cwd());
+          const turn = () => new Promise(r => setImmediate(r));
+          await turn();
+          await turn();
+          returned.catch(() => {});
+          await turn();
+          await turn();
+          console.log(JSON.stringify(events));
+        `,
+      ],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toEqual(["unhandledRejection:true:ERR_MODULE_NOT_FOUND", "rejectionHandled:true"]);
+    expect(exitCode).toBe(0);
+  });
+
+  it("with no listener the rejection is printed and the exit code is 1", async () => {
+    using dir = tempDir("bun-resolve-unhandled", { "index.js": "" });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", `Bun.resolve("./does-not-exist", process.cwd())`],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+    expect(stderr).toContain("does-not-exist");
+    expect(exitCode).toBe(1);
+  });
+});

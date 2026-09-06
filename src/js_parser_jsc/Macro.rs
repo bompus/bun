@@ -846,8 +846,12 @@ impl<'a> Run<'a> {
                     .wait_for_promise(promise)
                     .map_err(|stopped| MacroError::Js(stopped.throw(self.global)))?;
 
-                let promise_result = promise.result(vm.jsc_vm());
                 let rejected = promise.status() == jsc::js_promise::Status::Rejected;
+                if rejected {
+                    // Reported below through `unhandled_rejection`; not again by the tracker.
+                    promise.set_handled(vm.jsc_vm());
+                }
+                let promise_result = promise.result(vm.jsc_vm());
 
                 if promise_result.is_undefined() && self.is_top_level {
                     self.is_top_level = false;

@@ -32,13 +32,6 @@ unsafe extern "C" {
         arg0: &JSGlobalObject,
         js_value1: JSValue,
     ) -> *mut JSPromise;
-    /// **DEPRECATED** This function does not notify the VM about the rejection,
-    /// meaning it will not trigger unhandled rejection handling. Use
-    /// `JSC__JSPromise__rejectedPromise` instead.
-    safe fn JSC__JSPromise__rejectedPromiseValue(
-        arg0: &JSGlobalObject,
-        js_value1: JSValue,
-    ) -> JSValue;
     safe fn JSC__JSPromise__resolvedPromise(
         arg0: &JSGlobalObject,
         js_value1: JSValue,
@@ -232,10 +225,8 @@ impl JSPromise {
             return value;
         }
 
-        if value.is_any_error() {
-            return Self::dangerously_create_rejected_promise_value_without_notifying_vm(
-                global, value,
-            );
+        if let Some(err) = value.to_error() {
+            return Self::rejected_promise_value(global, err);
         }
 
         Self::resolved_promise_value(global, value)
@@ -263,6 +254,9 @@ impl JSPromise {
         JSPromise::opaque_ref(p).status()
     }
 
+    /// The settled value, or an empty `JSValue` while pending. Reading a
+    /// rejection does not mark it handled: native code that consumes one
+    /// calls [`set_handled`](Self::set_handled) itself.
     pub fn result(&mut self, vm: &VM) -> JSValue {
         JSC__JSPromise__result(self, vm)
     }
@@ -285,23 +279,33 @@ impl JSPromise {
         JSC__JSPromise__resolvedPromiseValue(global, value)
     }
 
-    /// Create a new rejected promise rejecting to a given value.
+    /// Create a new promise rejected with `value`. The rejection is registered
+    /// with the unhandled-rejection tracker like a `Promise.reject()` from JS:
+    /// it is reported unless something handles it by the end of the tick.
     ///
-    /// Note: If you want the result as a `JSValue`, use `rejected_promise().to_js()` instead.
+    /// `value` is the rejection reason, not a `JSC::Exception` cell; for a
+    /// pending exception use [`rejected_promise_from_exception`](Self::rejected_promise_from_exception).
     pub fn rejected_promise(global: &JSGlobalObject, value: JSValue) -> &mut JSPromise {
         // FFI returns a non-null GC-managed cell tied to `global`'s VM.
         JSPromise::opaque_mut(JSC__JSPromise__rejectedPromise(global, value))
     }
 
-    /// **DEPRECATED** use `rejected_promise` instead.
-    ///
-    /// Create a new rejected promise without notifying the VM. Unhandled
-    /// rejections created this way will not trigger unhandled rejection handling.
-    pub fn dangerously_create_rejected_promise_value_without_notifying_vm(
+    /// [`rejected_promise`](Self::rejected_promise) as a `JSValue`.
+    pub fn rejected_promise_value(global: &JSGlobalObject, value: JSValue) -> JSValue {
+        Self::rejected_promise(global, value).to_js()
+    }
+
+    /// Create a new promise rejected with the exception `err` proves is
+    /// pending, taking it off the VM (see [`reject`](Self::reject)). A
+    /// termination is not a rejection reason: it stays pending and comes back
+    /// as `Err`.
+    pub fn rejected_promise_from_exception(
         global: &JSGlobalObject,
-        value: JSValue,
-    ) -> JSValue {
-        JSC__JSPromise__rejectedPromiseValue(global, value)
+        err: JsError,
+    ) -> JsResult<JSValue> {
+        let promise = Self::create(global);
+        promise.reject(global, Err(err))?;
+        Ok(promise.to_js())
     }
 
     /// Fulfill an existing promise with the value.

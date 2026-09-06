@@ -3993,20 +3993,9 @@ JSC::JSPromise* JSC__JSPromise__resolvedPromise(JSC::JSGlobalObject* globalObjec
 {
     UNUSED_PARAM(arg1);
 
-    // if the promise is rejected we automatically mark it as handled so it
-    // doesn't end up in the promise rejection tracker
-    switch (promise->status()) {
-    case JSC::JSPromise::Status::Rejected: {
-        if (!(promise->flags() & JSC::JSPromise::isFirstResolvingFunctionCalledFlag))
-            promise->markAsHandled();
-    }
-    // fallthrough intended
-    case JSC::JSPromise::Status::Fulfilled: {
-        return JSValue::encode(promise->result());
-    }
-    default:
+    if (promise->status() == JSC::JSPromise::Status::Pending)
         return JSValue::encode(JSValue {});
-    }
+    return JSValue::encode(promise->result());
 }
 
 [[ZIG_EXPORT(nothrow)]] uint32_t JSC__JSPromise__status(const JSC::JSPromise* arg0)
@@ -5155,20 +5144,6 @@ void JSC__VM__throwError(JSC::VM* vm_, JSC::JSGlobalObject* arg1, JSC::EncodedJS
     // https://github.com/oven-sh/bun/issues/13311
     JSC::Exception* exception = JSC::Exception::create(vm, value);
     scope.throwException(arg1, exception);
-}
-
-/// **DEPRECATED** This function does not notify the VM about the rejection,
-/// meaning it will not trigger unhandled rejection handling. Use JSC__JSPromise__rejectedPromise instead.
-JSC::EncodedJSValue JSC__JSPromise__rejectedPromiseValue(JSC::JSGlobalObject* globalObject,
-    JSC::EncodedJSValue JSValue1)
-{
-    auto& vm = JSC::getVM(globalObject);
-    JSC::JSPromise* promise = JSC::JSPromise::create(vm, globalObject->promiseStructure());
-    promise->setFlags(static_cast<uint16_t>(JSC::JSPromise::Status::Rejected));
-    promise->setSlot(vm, JSC::JSValue::decode(JSValue1));
-    JSC::ensureStillAliveHere(promise);
-    JSC::ensureStillAliveHere(JSC::JSValue::decode(JSValue1));
-    return JSC::JSValue::encode(promise);
 }
 
 JSC::EncodedJSValue JSC__JSPromise__resolvedPromiseValue(JSC::JSGlobalObject* globalObject,

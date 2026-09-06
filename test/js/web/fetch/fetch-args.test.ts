@@ -1,5 +1,6 @@
 import { TCPSocketListener } from "bun";
 import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
+import { bunEnv, bunExe } from "harness";
 
 let server;
 let requestCount = 0;
@@ -304,4 +305,144 @@ describe("does not send a request when", () => {
       expect(requestCount).toBe(prevCount);
     });
   }
+});
+
+// fetch() never throws synchronously: argument and option errors come back as a
+// rejected promise. Those promises must take part in unhandled-rejection
+// tracking exactly like a `Promise.reject()`: an unhandled one reaches
+// process.on("unhandledRejection") with (reason, promise), the default policy
+// prints it and exits 1, and a late .catch() emits "rejectionHandled" only
+// after "unhandledRejection" fired for that promise.
+describe("early rejections are tracked like any other rejection", () => {
+  // Every case rejects before a request is queued, so nothing here touches the network.
+  const cases = /* js */ `
+    const used = new Request("http://127.0.0.1:1/", { method: "POST", body: "abc" });
+    await used.text();
+    const blobUrl = URL.createObjectURL(new Blob(["x"]));
+    URL.revokeObjectURL(blobUrl);
+    const cases = {
+      abortedSignal: () => fetch("http://127.0.0.1:1/", { signal: AbortSignal.abort() }),
+      signalNotAbortSignal: () => fetch("http://127.0.0.1:1/", { signal: "nope" }),
+      getWithBody: () => fetch("http://127.0.0.1:1/", { method: "GET", body: "x" }),
+      bodyAlreadyUsed: () => fetch(used),
+      invalidHeaderName: () => fetch("http://127.0.0.1:1/", { headers: { "bad header\\n": "x" } }),
+      invalidRedirect: () => fetch("http://127.0.0.1:1/", { redirect: "bogus" }),
+      invalidProxyUrl: () => fetch("http://127.0.0.1:1/", { proxy: "not a url::" }),
+      proxyWithUnix: () => fetch("http://x/", { unix: "/tmp/nope.sock", proxy: "http://127.0.0.1:1" }),
+      invalidTlsOption: () => fetch("https://127.0.0.1:1/", { tls: { ca: 42 } }),
+      symbolBody: () => fetch("http://127.0.0.1:1/", { method: "POST", body: Symbol("x") }),
+      toStringThrows: () => fetch({ toString() { throw new Error("toString"); } }),
+      revokedBlobUrl: () => fetch(blobUrl),
+      invalidDataUrl: () => fetch("data:application/json;base64,!!!!"),
+      blankUrl: () => fetch(""),
+      noArguments: () => fetch(),
+      invalidUrl: () => fetch("http://[bad"),
+      unsupportedProtocol: () => fetch("gopher://x/"),
+    };
+  `;
+  const caseNames = [
+    "abortedSignal",
+    "signalNotAbortSignal",
+    "getWithBody",
+    "bodyAlreadyUsed",
+    "invalidHeaderName",
+    "invalidRedirect",
+    "invalidProxyUrl",
+    "proxyWithUnix",
+    "invalidTlsOption",
+    "symbolBody",
+    "toStringThrows",
+    "revokedBlobUrl",
+    "invalidDataUrl",
+    "blankUrl",
+    "noArguments",
+    "invalidUrl",
+    "unsupportedProtocol",
+  ];
+  // unhandledRejection is delivered at the end of the event-loop turn that
+  // rejected, rejectionHandled on the turn after the late .catch().
+  const turn = `await new Promise(r => setImmediate(r)); await new Promise(r => setImmediate(r));`;
+
+  async function run(script: string, ...args: string[]) {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), ...args, "-e", script],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  }
+
+  test("unhandledRejection receives (reason, promise), then rejectionHandled on a late catch", async () => {
+    const { stdout, stderr, exitCode } = await run(/* js */ `
+      ${cases}
+      const names = new Map();
+      const events = [];
+      process.on("unhandledRejection", (reason, promise) => {
+        events.push("unhandledRejection:" + names.get(promise) + ":" + (reason?.code ?? reason?.name ?? typeof reason));
+      });
+      process.on("rejectionHandled", promise => events.push("rejectionHandled:" + names.get(promise)));
+      for (const [name, make] of Object.entries(cases)) names.set(make(), name);
+      ${turn}
+      for (const promise of names.keys()) promise.catch(() => {});
+      ${turn}
+      console.log(JSON.stringify(events));
+    `);
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toEqual([
+      "unhandledRejection:abortedSignal:AbortError",
+      "unhandledRejection:signalNotAbortSignal:ERR_INVALID_ARG_TYPE",
+      "unhandledRejection:getWithBody:ERR_INVALID_ARG_VALUE",
+      "unhandledRejection:bodyAlreadyUsed:ERR_BODY_ALREADY_USED",
+      "unhandledRejection:invalidHeaderName:ERR_INVALID_HTTP_TOKEN",
+      "unhandledRejection:invalidRedirect:TypeError",
+      "unhandledRejection:invalidProxyUrl:ERR_INVALID_ARG_VALUE",
+      "unhandledRejection:proxyWithUnix:ERR_INVALID_ARG_VALUE",
+      "unhandledRejection:invalidTlsOption:TypeError",
+      "unhandledRejection:symbolBody:TypeError",
+      "unhandledRejection:toStringThrows:Error",
+      "unhandledRejection:revokedBlobUrl:ERR_INVALID_ARG_VALUE",
+      "unhandledRejection:invalidDataUrl:Error",
+      "unhandledRejection:blankUrl:ERR_INVALID_URL",
+      "unhandledRejection:noArguments:ERR_MISSING_ARGS",
+      "unhandledRejection:invalidUrl:ERR_INVALID_URL",
+      "unhandledRejection:unsupportedProtocol:ERR_INVALID_ARG_VALUE",
+      ...caseNames.map(name => "rejectionHandled:" + name),
+    ]);
+    expect(exitCode).toBe(0);
+  });
+
+  test("with no listener the rejection is printed and the exit code is 1", async () => {
+    const { stderr, exitCode } = await run(/* js */ `
+      fetch("gopher://x/");
+      fetch("http://127.0.0.1:1/", { signal: AbortSignal.abort() });
+      ${turn}
+    `);
+    expect(stderr).toContain("protocol must be http:, https: or s3:");
+    expect(stderr).toContain("AbortError");
+    expect(exitCode).toBe(1);
+  });
+
+  test("--unhandled-rejections=strict sees them too", async () => {
+    const { stderr, exitCode } = await run(`fetch("gopher://x/"); ${turn}`, "--unhandled-rejections=strict");
+    expect(stderr).toContain("protocol must be http:, https: or s3:");
+    expect(exitCode).toBe(1);
+  });
+
+  test("a rejection handled in the same tick is not reported and emits no rejectionHandled", async () => {
+    const { stdout, stderr, exitCode } = await run(/* js */ `
+      ${cases}
+      const events = [];
+      process.on("unhandledRejection", reason => events.push("unhandledRejection:" + reason?.message));
+      process.on("rejectionHandled", () => events.push("rejectionHandled"));
+      const reasons = [];
+      for (const make of Object.values(cases)) make().catch(e => reasons.push(e?.code ?? e?.name ?? typeof e));
+      ${turn}
+      console.log(JSON.stringify({ events, rejected: reasons.length }));
+    `);
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toEqual({ events: [], rejected: caseNames.length });
+    expect(exitCode).toBe(0);
+  });
 });

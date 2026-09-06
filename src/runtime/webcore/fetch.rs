@@ -163,10 +163,7 @@ fn data_url_response(url: BunString, global_this: &JSGlobalObject) -> JSValue {
             None => {
                 let err =
                     global_this.create_error_instance(format_args!("failed to fetch the data URL"));
-                return JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                    global_this,
-                    err,
-                );
+                return JSPromise::rejected_promise_value(global_this, err);
             }
         }
     };
@@ -337,7 +334,7 @@ fn reject_on_exception(
             }
         },
     };
-    Ok(JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(global_this, err))
+    Ok(JSPromise::rejected_promise_value(global_this, err))
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -375,12 +372,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
             jsc::ErrorCode::MISSING_ARGS,
             format_args!("fetch() expects a string but received no arguments."),
         );
-        return Ok(
-            JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                global_this,
-                err,
-            ),
-        );
+        return Ok(JSPromise::rejected_promise_value(global_this, err));
     }
 
     let mut headers: Option<Headers> = None;
@@ -514,12 +506,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
             jsc::ErrorCode::INVALID_URL,
             format_args!("fetch() URL must not be a blank string."),
         );
-        return Ok(
-            JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                global_this,
-                err,
-            ),
-        );
+        return Ok(JSPromise::rejected_promise_value(global_this, err));
     }
 
     if url_str.starts_with_ascii(b"data:") {
@@ -536,12 +523,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
                 jsc::ErrorCode::INVALID_URL,
                 format_args!("fetch() URL is invalid"),
             );
-            return Ok(
-                JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                    global_this,
-                    err,
-                ),
-            );
+            return Ok(JSPromise::rejected_promise_value(global_this, err));
         }
     };
     let mut url_proxy_buffer = owned_url.into_href().into_vec();
@@ -873,11 +855,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
                                 jsc::ErrorCode::INVALID_ARG_VALUE,
                                 format_args!("fetch() proxy URL is invalid"),
                             );
-                            return Ok(
-                                JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                                    global_this, err,
-                                ),
-                            );
+                            return Ok(JSPromise::rejected_promise_value(global_this, err));
                         }
                         let mut buffer: Vec<u8> = Vec::with_capacity(url_proxy_buffer.len());
                         buffer.extend_from_slice(&url_proxy_buffer);
@@ -908,11 +886,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
                                         jsc::ErrorCode::INVALID_ARG_VALUE,
                                         format_args!("fetch() proxy URL is invalid"),
                                     );
-                                    return Ok(
-                                        JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                                            global_this, err,
-                                        ),
-                                    );
+                                    return Ok(JSPromise::rejected_promise_value(global_this, err));
                                 }
                                 let mut buffer: Vec<u8> =
                                     Vec::with_capacity(url_proxy_buffer.len());
@@ -979,12 +953,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
                     jsc::ErrorCode::INVALID_ARG_TYPE,
                     format_args!("signal is not of type AbortSignal."),
                 );
-                return Ok(
-                    JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                        global_this,
-                        err,
-                    ),
-                );
+                return Ok(JSPromise::rejected_promise_value(global_this, err));
             }
         }
 
@@ -1007,12 +976,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
                     jsc::ErrorCode::INVALID_ARG_TYPE,
                     format_args!("signal is not of type AbortSignal."),
                 );
-                return Ok(
-                    JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                        global_this,
-                        err,
-                    ),
-                );
+                return Ok(JSPromise::rejected_promise_value(global_this, err));
             }
         }
 
@@ -1214,12 +1178,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
             jsc::ErrorCode::INVALID_ARG_VALUE,
             format_args!("fetch() cannot use a proxy with a unix socket."),
         );
-        return Ok(
-            JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                global_this,
-                err,
-            ),
-        );
+        return Ok(JSPromise::rejected_promise_value(global_this, err));
     }
 
     // This is not 100% correct.
@@ -1268,12 +1227,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
                             bstr::BStr::new(url_path_decoded)
                         ),
                     );
-                    return Ok(
-                        JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                            global_this,
-                            err,
-                        ),
-                    );
+                    return Ok(JSPromise::rejected_promise_value(global_this, err));
                 }
             }
 
@@ -1382,12 +1336,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
                 jsc::ErrorCode::INVALID_ARG_VALUE,
                 format_args!("protocol must be http:, https: or s3:"),
             );
-            return Ok(
-                JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                    global_this,
-                    err,
-                ),
-            );
+            return Ok(JSPromise::rejected_promise_value(global_this, err));
         }
     }
 
@@ -1399,12 +1348,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
             jsc::ErrorCode::INVALID_ARG_VALUE,
             format_args!("fetch() request with GET/HEAD method cannot have body."),
         );
-        return Ok(
-            JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                global_this,
-                err,
-            ),
-        );
+        return Ok(JSPromise::rejected_promise_value(global_this, err));
     }
 
     // Fetch spec step 11: reject synchronously for a pre-aborted signal. Runs
@@ -1419,12 +1363,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
                 }
             }
             body.detach();
-            return Ok(
-                JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                    global_this,
-                    reason,
-                ),
-            );
+            return Ok(JSPromise::rejected_promise_value(global_this, reason));
         }
     }
 
@@ -1462,11 +1401,10 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
                 old.detach();
                 break 'prepare_body;
             }
-            let rejected_value =
-                JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                    global_this,
-                    global_this.create_error_instance(format_args!("Failed to start s3 stream")),
-                );
+            let rejected_value = JSPromise::rejected_promise_value(
+                global_this,
+                global_this.create_error_instance(format_args!("Failed to start s3 stream")),
+            );
             // HTTPRequestBody has no Drop impl, so a bare `drop(body)` would
             // leak the S3 Blob.Store ref.
             body.detach();
@@ -1498,11 +1436,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
             let opened_fd = match opened_fd_res {
                 Err(err) => {
                     let err_js = err.to_js(global_this);
-                    let rejected_value =
-                        JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                            global_this,
-                            err_js,
-                        );
+                    let rejected_value = JSPromise::rejected_promise_value(global_this, err_js);
                     return Ok(rejected_value);
                 }
                 Ok(fd) => fd,
@@ -1594,10 +1528,7 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
             match res {
                 Err(err) => {
                     let rejected_value =
-                        JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                            global_this,
-                            err.to_js(global_this),
-                        );
+                        JSPromise::rejected_promise_value(global_this, err.to_js(global_this));
                     body.detach();
                     return Ok(rejected_value);
                 }
@@ -1686,14 +1617,12 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
             // `defer body.ReadableStream.deinit()` → Drop on `body` scope exit.
 
             if method != Method::PUT && method != Method::POST {
-                return Ok(
-                    JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                        global_this,
-                        global_this.create_error_instance(format_args!(
-                            "Only POST and PUT do support body when using S3"
-                        )),
-                    ),
-                );
+                return Ok(JSPromise::rejected_promise_value(
+                    global_this,
+                    global_this.create_error_instance(format_args!(
+                        "Only POST and PUT do support body when using S3"
+                    )),
+                ));
             }
             let promise = jsc::JSPromiseStrong::init(global_this);
             let promise_value = promise.value();
@@ -1767,12 +1696,10 @@ fn fetch_impl<const ALLOW_GET_BODY: bool>(
         ) {
             Ok(r) => r,
             Err(sign_err) => {
-                return Ok(
-                    JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                        global_this,
-                        s3::get_js_sign_error(sign_err.into(), global_this),
-                    ),
-                );
+                return Ok(JSPromise::rejected_promise_value(
+                    global_this,
+                    s3::get_js_sign_error(sign_err.into(), global_this),
+                ));
             }
         };
         // `defer result.deinit()` → Drop.
