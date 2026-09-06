@@ -6381,6 +6381,19 @@ describe("header object normalization matches node", () => {
     expect(trailerHeaders).toEqual(expected);
   });
 
+  it("a trailer object whose every value is undefined ends the stream without a trailer block", async () => {
+    const { trailerHeaders, responseHeaders } = await roundTrip({ trailers: { "grpc-message": undefined } });
+    expect(responseHeaders).toEqual({});
+    expect(trailerHeaders).toBeUndefined();
+  });
+
+  it("an undefined value or an empty array is not a field, whatever the name", async () => {
+    const { requestHeaders } = await roundTrip({
+      request: { "bad name": undefined, ":bogus": undefined, connection: [], te: [], "x-ok": "ok" },
+    });
+    expect(requestHeaders).toEqual({ "x-ok": "ok" });
+  });
+
   // The rejected block had already walked "x-a: ok". It must not advance the shared HPACK
   // table, or the next request (which repeats "x-a: ok") fails the session with COMPRESSION_ERROR.
   it("a request rejected for an invalid value leaves the session usable", async () => {

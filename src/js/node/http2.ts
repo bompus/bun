@@ -3768,21 +3768,15 @@ function assertNoConnectionHeaders(headers): void {
   for (let i = 0; i < keys.length; i++) {
     let value = headers[keys[i]];
     if (value === undefined) continue;
-    const lower = keys[i].toLowerCase();
-    let forbidden = kForbiddenConnectionHeaders.has(lower);
-    if (!forbidden && lower === "te") {
-      if ($isArray(value)) {
-        if (value.length === 0) continue;
-        if (value.length === 1) value = `${value[0]}`;
-      } else {
-        value = `${value}`;
-      }
-      forbidden = value !== "trailers";
+    if ($isArray(value)) {
+      if (value.length === 0) continue;
+      if (value.length === 1) value = `${value[0]}`;
+    } else {
+      value = `${value}`;
     }
-    if (forbidden) {
-      const err = new TypeError(`HTTP/1 Connection specific headers are forbidden: "${lower}"`);
-      err.code = "ERR_HTTP2_INVALID_CONNECTION_HEADERS";
-      throw err;
+    const lower = keys[i].toLowerCase();
+    if (kForbiddenConnectionHeaders.has(lower) || (lower === "te" && value !== "trailers")) {
+      throw $ERR_HTTP2_INVALID_CONNECTION_HEADERS(`HTTP/1 Connection specific headers are forbidden: "${lower}"`);
     }
   }
 }
@@ -6049,7 +6043,8 @@ class ClientHttp2Session extends Http2Session {
         const headerNames = ObjectKeys(headers);
         for (let i = 0; i < headerNames.length; i++) {
           const name = headerNames[i];
-          if (name === "") continue;
+          // node's mapToHeaders skips an undefined value before it looks at the name.
+          if (name === "" || headers[name] === undefined) continue;
           if (name.charCodeAt(0) === 0x3a /* ':' */) {
             // Unknown pseudo-header names throw synchronously (node's mapToHeaders); known ones
             // are still re-checked by the native encoder at submission time.

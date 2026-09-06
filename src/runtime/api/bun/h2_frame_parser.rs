@@ -5891,6 +5891,23 @@ impl H2FrameParser {
             }
         }
 
+        // Every field was skipped (undefined values): nghttp2 peers reject a zero-length header
+        // block, so end the stream the way noTrailers() does, with an empty DATA frame.
+        if pending.fields.is_empty() {
+            stream.wait_for_trailers = false;
+            let _ = this.send_data(
+                &mut stream,
+                b"",
+                JSValue::UNDEFINED,
+                SendDataOptions {
+                    close: true,
+                    suppress_half_closed_local_dispatch: false,
+                    defer_write_callback: false,
+                },
+            );
+            return Ok(JSValue::UNDEFINED);
+        }
+
         let mut encoded_headers: Vec<u8> = Vec::new();
         match this.encode_header_list(&mut encoded_headers, &pending) {
             Ok(()) => {}
