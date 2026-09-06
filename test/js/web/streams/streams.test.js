@@ -596,6 +596,100 @@ it("ReadableStream (direct): controller.close() outside pull with a throwing clo
   expect((await reader.read()).done).toBe(true);
 });
 
+// A direct stream's controller.close(error) with a truthy error is the source's
+// failure. Every consumer must reject with it instead of resolving with the
+// bytes written so far as if the body had ended cleanly. A falsy argument is
+// the same clean close as close().
+describe("ReadableStream (direct): controller.close(error) fails the consumer", () => {
+  const boom = () => new Error("boom");
+  const sources = {
+    sync: () =>
+      new ReadableStream({
+        type: "direct",
+        pull(c) {
+          c.write("abc");
+          c.close(boom());
+        },
+      }),
+    // close(error) while pull() is still pending, then pull() resolves.
+    async: () =>
+      new ReadableStream({
+        type: "direct",
+        async pull(c) {
+          c.write("abc");
+          await Bun.sleep(1);
+          c.close(boom());
+        },
+      }),
+    // close(error) runs, then pull() keeps going before it resolves.
+    "async-close-then-wait": () =>
+      new ReadableStream({
+        type: "direct",
+        async pull(c) {
+          c.write("abc");
+          c.close(boom());
+          await Bun.sleep(1);
+        },
+      }),
+  };
+  const consumers = {
+    "Response.text()": stream => new Response(stream).text(),
+    "Response.json()": stream => new Response(stream).json(),
+    "Response.arrayBuffer()": stream => new Response(stream).arrayBuffer(),
+    "Response.bytes()": stream => new Response(stream).bytes(),
+    readableStreamToText: stream => readableStreamToText(stream),
+    readableStreamToArray: stream => readableStreamToArray(stream),
+    readableStreamToArrayBuffer: stream => readableStreamToArrayBuffer(stream),
+    readableStreamToBytes: stream => readableStreamToBytes(stream),
+    "for await": async stream => {
+      for await (const _ of stream) {
+      }
+    },
+    "Bun.write": async stream => {
+      using dir = tempDir("direct-close-error", {});
+      await Bun.write(join(String(dir), "out.txt"), stream);
+    },
+    "fetch body": async stream => {
+      await using server = Bun.serve({
+        port: 0,
+        async fetch(req) {
+          return new Response(await req.text());
+        },
+      });
+      const res = await fetch(server.url, { method: "POST", body: stream });
+      await res.text();
+    },
+  };
+
+  for (const [sourceName, source] of Object.entries(sources)) {
+    it.each(Object.keys(consumers))(`${sourceName} close(error): %s rejects with the error`, async consumerName => {
+      const stream = source();
+      await expect(consumers[consumerName](stream)).rejects.toThrow("boom");
+    });
+  }
+
+  it.each([
+    ["close()", c => c.close()],
+    ["close(undefined)", c => c.close(undefined)],
+    ["close(null)", c => c.close(null)],
+    ["close(false)", c => c.close(false)],
+    ['close("")', c => c.close("")],
+  ])("%s is a clean close", async (_, close) => {
+    const mk = () =>
+      new ReadableStream({
+        type: "direct",
+        pull(c) {
+          c.write("abc");
+          close(c);
+        },
+      });
+    expect(await new Response(mk()).text()).toBe("abc");
+    expect(await new Response(mk()).bytes()).toEqual(new TextEncoder().encode("abc"));
+    using dir = tempDir("direct-close-clean", {});
+    expect(await Bun.write(join(String(dir), "out.txt"), mk())).toBe(3);
+  });
+});
+
 it("ReadableStream (bytes)", async () => {
   var stream = new ReadableStream({
     start(controller) {

@@ -895,13 +895,21 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundDirectWrite, (JSGlobalObject *
 // controller.close(): if closing fails part-way (the sink's end(), the source's close() hook),
 // the stream cannot complete normally — it is errored with that failure (so a pending read
 // settles) and the failure is still thrown to the caller of close().
+// controller.close(reason) with a truthy reason is the source's failure: the same as error(reason).
 JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundDirectClose, (JSGlobalObject * globalObject, CallFrame* callFrame))
 {
     auto& vm = getVM(globalObject);
     auto* controller = dynamicDowncast<JSDirectStreamController>(callFrame->argument(0));
     if (!controller || controller->m_closed) [[unlikely]]
         return JSValue::encode(jsUndefined());
-    return enterStreams(globalObject, [&] { controller->onClose(globalObject, callFrame->argument(1)); }, [&](JSValue error) {
+    JSValue reason = callFrame->argument(1);
+    if (reason.toBoolean(globalObject)) {
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        controller->handleError(globalObject, reason);
+        RETURN_IF_EXCEPTION(scope, {});
+        return JSValue::encode(jsUndefined());
+    }
+    return enterStreams(globalObject, [&] { controller->onClose(globalObject, reason); }, [&](JSValue error) {
         auto scope = DECLARE_THROW_SCOPE(vm);
         controller->handleError(globalObject, error);
         RETURN_IF_EXCEPTION(scope, );

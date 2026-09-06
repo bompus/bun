@@ -1099,6 +1099,9 @@ JSValue consumeDirectStreamToArrayBuffer(JSGlobalObject* globalObject, WebCore::
     stream->m_lockedWithoutReader = false;
     readableStreamCloseIfPossible(globalObject, stream);
     RETURN_IF_EXCEPTION(scope, {});
+    // close(reason) marked the capability handled; the caller's promise must not be.
+    if (capability->status() == JSPromise::Status::Rejected)
+        RELEASE_AND_RETURN(scope, promiseRejectedWith(globalObject, capability->result()));
     return capability;
 }
 
@@ -1697,6 +1700,9 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundOneShotDirectClose, (JSGlobalO
     if (sink->m_closed)
         return JSValue::encode(jsUndefined());
     sink->m_closed = true;
+    // close(reason) with a truthy reason is the source's failure.
+    JSValue reason = callFrame->argument(1);
+    const bool failed = reason.toBoolean(globalObject);
     JSValue closeFunction = sink->m_closeFunction.get();
     if (closeFunction.toBoolean(globalObject)) {
         auto callData = JSC::getCallData(closeFunction);
@@ -1704,9 +1710,27 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_boundOneShotDirectClose, (JSGlobalO
             throwTypeError(globalObject, scope, "The 'close' member of a direct ReadableStream's underlying source is not a function"_s);
             return {};
         }
-        MarkedArgumentBuffer noArguments;
-        JSC::call(globalObject, closeFunction, callData, jsUndefined(), noArguments);
+        MarkedArgumentBuffer closeArguments;
+        closeArguments.append(reason);
+        JSC::call(globalObject, closeFunction, callData, jsUndefined(), closeArguments);
         RETURN_IF_EXCEPTION(scope, {});
+    }
+    if (failed) {
+        MarkedArgumentBuffer closeArguments;
+        closeArguments.append(reason);
+        Bun::WebStreams::invokeMethod(vm, globalObject, sink->m_arrayBufferSink.get(), builtinNames(vm).closePublicName(), closeArguments);
+        RETURN_IF_EXCEPTION(scope, {});
+        if (auto* stream = sink->m_stream.get(); stream && stream->m_state == ReadableStreamState::Readable) {
+            Bun::WebStreams::readableStreamError(globalObject, stream, reason);
+            RETURN_IF_EXCEPTION(scope, {});
+        }
+        // The rejection reaches the consumer through the promise returned for the conversion.
+        if (auto* capability = sink->m_capabilityPromise.get(); capability && capability->status() == JSPromise::Status::Pending) {
+            Bun::WebStreams::rejectPromise(globalObject, capability, reason);
+            RETURN_IF_EXCEPTION(scope, {});
+            Bun::WebStreams::markPromiseAsHandled(vm, capability);
+        }
+        return JSValue::encode(jsUndefined());
     }
     MarkedArgumentBuffer noArguments;
     JSValue endResult = Bun::WebStreams::invokeMethod(vm, globalObject, sink->m_arrayBufferSink.get(), builtinNames(vm).endPublicName(), noArguments);

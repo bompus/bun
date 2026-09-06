@@ -1738,8 +1738,13 @@ impl FileSink {
                     }
                     bun_jsc::js_promise::Status::Rejected => {
                         // These don't ref().
+                        // Consumed here, as the Pending arm's on_reject_stream
+                        // consumes a later rejection: not an unhandledRejection.
                         // SAFETY: `js_promise` is non-null (`as_any_promise`).
-                        let result = unsafe { (*js_promise).result(global_this.vm()) };
+                        let result = unsafe {
+                            (*js_promise).set_handled();
+                            (*js_promise).result(global_this.vm())
+                        };
                         crate::dispatch::fold(self.handle_reject_stream(global_this, result));
                     }
                 }

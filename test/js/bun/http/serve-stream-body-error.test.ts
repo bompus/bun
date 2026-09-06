@@ -208,6 +208,51 @@ test.concurrent("mid-stream error in development mode: reported and not terminat
   expect(stderr).toContain("boom");
 });
 
+// A `type: "direct"` body fails through its controller's close(error). The
+// stream pump used to resolve on that close, so the server ended the response
+// as complete: a clean terminator after the chunks already sent, and no report
+// anywhere. The pump now rejects, so the body takes the same path as a
+// mid-stream error above.
+test.concurrent.each(["production", "development"])(
+  "direct-mid-stream-close-error in %s mode: the chunked body is not terminated as complete",
+  async mode => {
+    const { stdout, stderr, exitCode } = await runFixture("direct-mid-stream-close-error", mode);
+    expect({ result: JSON.parse(stdout), exitCode }).toEqual({
+      result: {
+        statusLine: "HTTP/1.1 200 OK",
+        cleanChunkedTerminator: false,
+        body: "7\r\nchunk-a\r\n",
+        errorCb: 0,
+        unhandled: 0,
+        secondStatusLine: "HTTP/1.1 200 OK",
+      },
+      exitCode: 0,
+    });
+    if (mode === "development") expect(stderr).toContain("boom");
+  },
+);
+
+// The synchronous variant: pull() writes and calls close(error) before it
+// returns. The pump result is a rejected promise, so the failure is reported
+// in both modes and the server keeps serving. The wire shape of this case is
+// the sink's concern (the buffered prefix still goes out with a
+// Content-Length), so only the report is pinned here.
+test.concurrent.each(["production", "development"])(
+  "direct-close-error in %s mode: the failure is reported",
+  async mode => {
+    const { stdout, stderr, exitCode } = await runFixture("direct-close-error", mode);
+    const { statusLine, errorCb, unhandled, secondStatusLine } = JSON.parse(stdout);
+    expect({ statusLine, errorCb, unhandled, secondStatusLine, exitCode }).toEqual({
+      statusLine: "HTTP/1.1 200 OK",
+      errorCb: 0,
+      unhandled: 0,
+      secondStatusLine: "HTTP/1.1 200 OK",
+      exitCode: 0,
+    });
+    expect(stderr).toContain("boom");
+  },
+);
+
 // The client aborts the download mid-stream, which makes Bun cancel the body
 // ReadableStream. The source's cancel() throws, but the rejected promise is
 // one Bun created internally: it must be marked handled rather than surfacing

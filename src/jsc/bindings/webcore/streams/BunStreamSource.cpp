@@ -126,6 +126,7 @@ void JSDirectSinkCloseState::visitChildrenImpl(JSCell* cell, Visitor& visitor)
     visitor.appendHidden(thisObject->m_underlyingSource);
     visitor.appendHidden(thisObject->m_sinkController);
     visitor.appendHidden(thisObject->m_closePromise);
+    visitor.appendHidden(thisObject->m_closeReason);
 }
 
 DEFINE_VISIT_CHILDREN(JSDirectSinkCloseState);
@@ -138,6 +139,7 @@ void JSDirectSinkCloseState::analyzeHeap(JSCell* cell, HeapAnalyzer& analyzer)
     analyzeBarrierEdge(vm, analyzer, cell, thisObject->m_underlyingSource, "underlyingSource"_s);
     analyzeBarrierEdge(vm, analyzer, cell, thisObject->m_sinkController, "sinkController"_s);
     analyzeBarrierEdge(vm, analyzer, cell, thisObject->m_closePromise, "closePromise"_s);
+    analyzeBarrierEdge(vm, analyzer, cell, thisObject->m_closeReason, "closeReason"_s);
 }
 
 const ClassInfo JSReadStreamIntoSinkOperation::s_info = { "ReadStreamIntoSinkOperation"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSReadStreamIntoSinkOperation) };
@@ -755,13 +757,19 @@ static void readDirectStreamCloseImpl(JSC::VM& vm, JSGlobalObject* globalObject,
     JSObject* underlyingSource = state->m_underlyingSource.get();
     state->m_underlyingSource.clear();
 
+    // A truthy reason is the source's failure: it errors the stream and rejects the pump's
+    // result, so the sink's owner sees a truncated body instead of a clean end.
+    const bool failed = reason.toBoolean(globalObject);
+    if (failed)
+        state->m_closeReason.set(vm, state, reason);
+
     if (auto* stream = dynamicDowncast<JSReadableStream>(streamValue)) {
         clearStreamControllerSlots(stream);
         stream->m_reader.clear();
         stream->m_lockedWithoutReader = false;
         // This path writes the terminal state directly (the controller and reader slots are
         // already torn down), so it settles the closed promise itself.
-        if (reason.toBoolean(globalObject)) {
+        if (failed) {
             stream->m_state = ReadableStreamState::Errored;
             stream->m_storedError.set(vm, stream, reason);
             rejectStreamClosedPromise(vm, stream, reason);
@@ -772,7 +780,10 @@ static void readDirectStreamCloseImpl(JSC::VM& vm, JSGlobalObject* globalObject,
     }
     if (auto* closePromise = state->m_closePromise.get()) {
         state->m_closePromise.clear();
-        resolvePromise(globalObject, closePromise, jsUndefined());
+        if (failed)
+            rejectPromise(globalObject, closePromise, reason);
+        else
+            resolvePromise(globalObject, closePromise, jsUndefined());
         RETURN_IF_EXCEPTION(scope, );
     }
 
@@ -861,7 +872,7 @@ JSValue readDirectStream(JSGlobalObject* globalObject, JSReadableStream* stream,
 
     if (auto* pullPromise = dynamicDowncast<JSPromise>(maybePromise)) {
         auto* result = JSPromise::create(vm, globalObject->promiseStructure());
-        pullPromise->performPromiseThenWithContext(vm, globalObject, runtime->onReturnUndefined(), jsUndefined(), result, jsUndefined());
+        pullPromise->performPromiseThenWithContext(vm, globalObject, runtime->onReadDirectStreamPullFulfilled(), jsUndefined(), result, state);
         return result;
     }
     if (stream->m_state == ReadableStreamState::Readable) {
@@ -869,6 +880,9 @@ JSValue readDirectStream(JSGlobalObject* globalObject, JSReadableStream* stream,
         state->m_closePromise.set(vm, state, closePromise);
         return closePromise;
     }
+    // pull() closed the stream before it returned. A close(reason) is a failed pump.
+    if (JSValue closeReason = state->m_closeReason.get())
+        return promiseRejectedWith(globalObject, closeReason);
     return jsUndefined();
 }
 
@@ -1339,6 +1353,20 @@ JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_onNativeSourceCallCloseMicrotask, (
     auto* adapter = uncheckedDowncast<JSNativeStreamSourceAdapter>(callFrame->argument(1));
     Bun::WebStreams::nativeSourceCallClose(vm, globalObject, adapter);
     RETURN_IF_EXCEPTION(scope, {});
+    return JSValue::encode(jsUndefined());
+}
+
+// readDirectStream's pull() promise fulfilled: the pump's result follows the stream. A
+// close(reason) that ran while pull() was pending makes it reject with that reason.
+JSC_DEFINE_HOST_FUNCTION(jsWebStreamsHandler_onReadDirectStreamPullFulfilled, (JSGlobalObject * globalObject, CallFrame* callFrame))
+{
+    auto& vm = getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    auto* state = uncheckedDowncast<JSDirectSinkCloseState>(callFrame->argument(1));
+    if (JSValue closeReason = state->m_closeReason.get()) {
+        throwException(globalObject, scope, closeReason);
+        return {};
+    }
     return JSValue::encode(jsUndefined());
 }
 

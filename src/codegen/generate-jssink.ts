@@ -143,7 +143,9 @@ function header() {
 
                 ~${controller}();
 
-                void detach();
+                // \`reason\` reaches onClose: undefined for a clean close,
+                // otherwise the failure the source closed with.
+                void detach(JSC::JSValue reason = JSC::jsUndefined());
 
                 void start(JSC::JSGlobalObject *globalObject, JSC::JSValue readableStream, JSC::JSValue onPull, JSC::JSValue onClose);
                 DECLARE_VISIT_CHILDREN;
@@ -397,6 +399,11 @@ static JSC::EncodedJSValue ${controller}__closeWithReason(JSC::JSGlobalObject* l
 
     ${name}__close(lexicalGlobalObject, ptr, reason);
 
+    // onClose reads a truthy reason as the source's failure.
+    JSC::JSValue closeReason = JSC::JSValue::decode(reason);
+    if (closeReason.isEmpty())
+        closeReason = JSC::jsUndefined();
+
     // detach() must still fire onClose (it transitions the direct
     // ReadableStream to closed/errored and calls underlyingSource.cancel())
     // even if the native close threw, matching the pre-reorder behaviour.
@@ -406,13 +413,13 @@ static JSC::EncodedJSValue ${controller}__closeWithReason(JSC::JSGlobalObject* l
         if (!scope.tryClearException()) {
             return {};
         }
-        controller->detach();
+        controller->detach(closeReason);
         (void)scope.tryClearException();
         scope.throwException(lexicalGlobalObject, pending);
         return {};
     }
 
-    controller->detach();
+    controller->detach(closeReason);
     RETURN_IF_EXCEPTION(scope, {});
     return JSC::JSValue::encode(JSC::jsUndefined());
 }
@@ -661,7 +668,7 @@ JSObject* JS${controllerName}::createPrototype(VM& vm, JSDOMGlobalObject& global
     return ${controllerPrototypeName}::create(vm, &globalObject, ${controllerPrototypeName}::createStructure(vm, &globalObject, globalObject.objectPrototype()));
 }
 
-void JS${controllerName}::detach() {
+void JS${controllerName}::detach(JSC::JSValue reason) {
     // Prevent re-entrancy.
     JSC::EnsureStillAliveScope readableStream(m_weakReadableStream.get());
     JSC::EnsureStillAliveScope onClose(m_onClose.get());
@@ -690,7 +697,7 @@ void JS${controllerName}::detach() {
         auto scope = DECLARE_THROW_SCOPE(vm);
         JSC::MarkedArgumentBuffer arguments;
         arguments.append(readableStream.value());
-        arguments.append(jsUndefined());
+        arguments.append(reason);
         AsyncContextFrame::call(globalObject, onClose.value(), JSC::jsUndefined(), arguments);
         RELEASE_AND_RETURN(scope, void());
     }

@@ -98,6 +98,25 @@ const sources: Record<string, () => ReadableStream> = {
         c.error(new Error("boom"));
       },
     }),
+  // A direct stream fails through its controller's close(error).
+  "direct-close-error": () =>
+    new ReadableStream({
+      type: "direct",
+      pull(c) {
+        c.write('{"rows":[1,');
+        c.close(new Error("boom"));
+      },
+    }),
+  "direct-mid-stream-close-error": () =>
+    new ReadableStream({
+      type: "direct",
+      async pull(c) {
+        const reached = chunkReachedClient();
+        c.write("chunk-a");
+        await reached;
+        c.close(new Error("boom"));
+      },
+    }),
   // Errors only after a chunk has already been flushed to the client.
   "mid-stream-reject": () =>
     new ReadableStream({
