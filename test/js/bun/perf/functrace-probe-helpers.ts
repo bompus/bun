@@ -90,6 +90,84 @@ export async function run(cmd: string[]): Promise<string> {
 }
 
 /**
+ * The body of linker-order.test.ts's pty-runner case. It runs concurrently with
+ * the tracer case in the real file: two more compiles, a bun under a pty and a
+ * bun on pipes, in the same worker process at the same moment.
+ */
+export async function runPtyCase(opts: { root: string; tag: string; watchdogMs?: number }): Promise<void> {
+  const { bunEnv, bunExe } = await import("harness");
+  const orderfile = join(import.meta.dir, "../../../../scripts/orderfile");
+  const compiler = process.env.CC || Bun.which("cc") || Bun.which("clang") || Bun.which("gcc");
+  const { root, tag } = opts;
+  const watchdogMs = opts.watchdogMs ?? 40_000;
+  const ptyrun = join(root, "ptyrun");
+  const preload = join(root, "empty.so");
+  const steps: string[] = [];
+  const t0 = performance.now();
+  const step = (name: string) => steps.push(`${name}@${(performance.now() - t0).toFixed(0)}ms`);
+
+  writeFileSync(join(root, "empty.c"), "int ptyrun_nothing;\n");
+  const probe = [
+    `process.stdin.once("data", data => {`,
+    `  const tty = Boolean(process.stdin.isTTY && process.stdout.isTTY);`,
+    `  const fields = [tty, process.stdout.columns ?? 0, process.env.LD_PRELOAD ?? "none", data.toString().trim()];`,
+    `  process.stdout.write(fields.join(" ") + "\\n");`,
+    `  process.stdin.pause();`,
+    `});`,
+  ].join("\n");
+
+  async function compile(args: string[]) {
+    await using proc = Bun.spawn({ cmd: [compiler!, "-O1", ...args], env: bunEnv, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    if (exitCode !== 0) throw new Error(`${compiler} ${args.join(" ")} exited ${exitCode}:\n${stdout}${stderr}`);
+  }
+
+  const live: Bun.Subprocess[] = [];
+  const watchdog = setTimeout(async () => {
+    const lines = [`=== pty ${tag} STALLED after ${watchdogMs} ms: steps ${steps.join(" ")}`, describeSelf()];
+    for (const proc of live) lines.push(describeTree(proc.pid));
+    lines.push(
+      `--- ps\n${await run(["sh", "-c", "ps -eo pid,ppid,pgid,stat,wchan:32,etime,time,args --forest | grep -v 'ps -eo' | head -80"])}`,
+    );
+    console.error(lines.join("\n"));
+    for (const proc of live) proc.kill("SIGKILL");
+  }, watchdogMs);
+
+  async function type(cmd: string[], env: Record<string, string>) {
+    const proc = Bun.spawn({
+      cmd,
+      env: { ...bunEnv, ...env },
+      stdin: new Blob(["hi\n"]),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    live.push(proc);
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const lines = stdout
+      .replace(/[\x00-\x1f]+/g, "\n")
+      .trim()
+      .split("\n");
+    return { line: lines.at(-1), stderr, exitCode };
+  }
+
+  try {
+    await Promise.all([
+      compile(["-o", ptyrun, join(orderfile, "ptyrun.c"), "-lutil"]).then(() => step("ptyrun")),
+      compile(["-shared", "-fPIC", "-o", preload, join(root, "empty.c")]).then(() => step("empty.so")),
+    ]);
+    const [pty, pipe] = await Promise.all([
+      type([ptyrun, bunExe(), "-e", probe], { PTYRUN_PRELOAD: preload }).then(r => (step("pty"), r)),
+      type([bunExe(), "-e", probe], {}).then(r => (step("pipe"), r)),
+    ]);
+    if (pty.line !== `true 80 ${preload} hi` || pipe.line !== "false 0 none hi") {
+      throw new Error(`${tag}: pty=${JSON.stringify(pty)} pipe=${JSON.stringify(pipe)}`);
+    }
+  } finally {
+    clearTimeout(watchdog);
+  }
+}
+
+/**
  * The body of linker-order.test.ts's tracer case, callable from a generated
  * test file so the same work runs inside a `bun test --parallel` worker that
  * has already run other files. On a stall it prints the process tree, the

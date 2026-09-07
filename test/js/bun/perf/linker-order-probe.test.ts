@@ -377,17 +377,27 @@ test/regression/issue/issue-1825-jest-mock-functions.test.ts
       const files: string[] = [];
       for (let i = 0; i < cases; i++) {
         const file = join(dir, `tracer-${String(i).padStart(3, "0")}.test.ts`);
+        // Two concurrent cases per file, the way the real file runs them: the
+        // pty runner and the tracer, so five compiles, a bun under a pty and a
+        // traced fixture are in flight in one worker at the same moment.
         writeFileSync(
           file,
           [
-            `import { test } from "bun:test";`,
+            `import { describe, it } from "bun:test";`,
             `import { mkdirSync } from "node:fs";`,
-            `import { runTracerCase } from ${JSON.stringify(helpers)};`,
-            `test(${JSON.stringify(`traced fixture ${i}`)}, async () => {`,
-            `  const root = ${JSON.stringify(join(dir, `case-${i}`))};`,
-            `  mkdirSync(root, { recursive: true });`,
-            `  await runTracerCase({ root, diag: ${JSON.stringify(join(dir, "diag.txt"))}, tag: ${JSON.stringify(`case-${i}`)} });`,
-            `}, 65000);`,
+            `import { runPtyCase, runTracerCase } from ${JSON.stringify(helpers)};`,
+            `const root = ${JSON.stringify(join(dir, `case-${i}`))};`,
+            `mkdirSync(root, { recursive: true });`,
+            `describe("tracer", () => {`,
+            `  it.concurrent(${JSON.stringify(`traced fixture ${i}`)}, async () => {`,
+            `    await runTracerCase({ root, diag: ${JSON.stringify(join(dir, "diag.txt"))}, tag: ${JSON.stringify(`case-${i}`)} });`,
+            `  }, 65000);`,
+            `});`,
+            `describe("pty", () => {`,
+            `  it.concurrent(${JSON.stringify(`pty runner ${i}`)}, async () => {`,
+            `    await runPtyCase({ root, tag: ${JSON.stringify(`case-${i}`)} });`,
+            `  }, 65000);`,
+            `});`,
             ``,
           ].join("\n"),
         );
