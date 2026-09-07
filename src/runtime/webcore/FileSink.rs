@@ -1612,6 +1612,22 @@ impl FileSink {
         self.end(None)
     }
 
+    /// `Bun.write(file, stream)`: the JS pump resolved. End it as [`end_js_stream`](Self::end_js_stream)
+    /// does, then settle `promise` with the byte count, or with the error of a write that failed:
+    /// now, or from `on_close` once a flush still in flight has put every accepted byte in the file.
+    pub(crate) fn settle_resolved_js_stream(
+        &self,
+        global_this: &JSGlobalObject,
+        promise: bun_jsc::JSPromiseStrong,
+    ) {
+        // A failed flush is recorded in `stream_error`, which the settle rejects with.
+        let _ = self.end_js_stream(global_this);
+        self.stream_done.set(promise);
+        if !self.must_be_kept_alive_until_eof.get() {
+            self.settle_stream_done();
+        }
+    }
+
     /// `Bun.write(file, stream)`: wire `stream`'s native source straight to this sink and return a
     /// promise for the byte count once the file is closed. `None` if the stream is not a native
     /// source; the caller falls back to the JS pump.

@@ -1654,15 +1654,10 @@ impl BlobExt for Blob {
             }
         }
 
-        Ok(match end_resolved_file_stream(&file_sink, global_this) {
-            Ok(written) => JSPromise::resolved_promise_value(global_this, written),
-            Err(err) => {
-                JSPromise::dangerously_create_rejected_promise_value_without_notifying_vm(
-                    global_this,
-                    err,
-                )
-            }
-        })
+        let promise = jsc::JSPromiseStrong::init(global_this);
+        let promise_value = promise.value();
+        file_sink.settle_resolved_js_stream(global_this, promise);
+        Ok(promise_value)
     }
 
     fn get_writer(&self, global_this: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue> {
@@ -5780,20 +5775,6 @@ struct FileStreamWrapper {
     pub sink: RefPtr<webcore::FileSink>,
 }
 
-/// The JS pump into a `Bun.write` sink resolved. End it: the value to settle
-/// with is the byte count, or the error that kept accepted bytes from the file.
-fn end_resolved_file_stream(
-    sink: &webcore::FileSink,
-    global_this: &JSGlobalObject,
-) -> Result<JSValue, JSValue> {
-    match sink.end_js_stream(global_this) {
-        Ok(()) => Ok(JSValue::js_number(
-            sink.stream_bytes.get().unwrap_or(0) as f64,
-        )),
-        Err(err) => Err(err.to_js(global_this)),
-    }
-}
-
 pub(crate) fn on_file_stream_resolve_request_stream(
     global_this: &JSGlobalObject,
     callframe: &CallFrame,
@@ -5807,10 +5788,8 @@ pub(crate) fn on_file_stream_resolve_request_stream(
     if let Some(stream) = strong.get() {
         stream.done();
     }
-    match end_resolved_file_stream(&this.sink, global_this) {
-        Ok(written) => this.promise.resolve(global_this, written)?,
-        Err(err) => this.promise.reject(global_this, Ok(err))?,
-    }
+    let promise = core::mem::replace(&mut this.promise, jsc::JSPromiseStrong::empty());
+    this.sink.settle_resolved_js_stream(global_this, promise);
     Ok(JSValue::UNDEFINED)
 }
 
