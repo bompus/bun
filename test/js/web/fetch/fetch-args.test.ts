@@ -380,7 +380,9 @@ describe("early rejections are tracked like any other rejection", () => {
       const names = new Map();
       const events = [];
       process.on("unhandledRejection", (reason, promise) => {
-        events.push("unhandledRejection:" + names.get(promise) + ":" + (reason?.code ?? reason?.name ?? typeof reason));
+        // DOMException#code is the legacy numeric code, so prefer a string code, else the name.
+        const kind = typeof reason?.code === "string" ? reason.code : (reason?.name ?? typeof reason);
+        events.push("unhandledRejection:" + names.get(promise) + ":" + kind);
       });
       process.on("rejectionHandled", promise => events.push("rejectionHandled:" + names.get(promise)));
       for (const [name, make] of Object.entries(cases)) names.set(make(), name);
@@ -395,11 +397,11 @@ describe("early rejections are tracked like any other rejection", () => {
       "unhandledRejection:signalNotAbortSignal:ERR_INVALID_ARG_TYPE",
       "unhandledRejection:getWithBody:ERR_INVALID_ARG_VALUE",
       "unhandledRejection:bodyAlreadyUsed:ERR_BODY_ALREADY_USED",
-      "unhandledRejection:invalidHeaderName:ERR_INVALID_HTTP_TOKEN",
-      "unhandledRejection:invalidRedirect:TypeError",
+      "unhandledRejection:invalidHeaderName:TypeError",
+      "unhandledRejection:invalidRedirect:ERR_INVALID_ARG_TYPE",
       "unhandledRejection:invalidProxyUrl:ERR_INVALID_ARG_VALUE",
       "unhandledRejection:proxyWithUnix:ERR_INVALID_ARG_VALUE",
-      "unhandledRejection:invalidTlsOption:TypeError",
+      "unhandledRejection:invalidTlsOption:ERR_INVALID_ARG_TYPE",
       "unhandledRejection:symbolBody:TypeError",
       "unhandledRejection:toStringThrows:Error",
       "unhandledRejection:revokedBlobUrl:ERR_INVALID_ARG_VALUE",
