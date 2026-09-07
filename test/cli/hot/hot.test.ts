@@ -896,3 +896,60 @@ it(
   },
   timeout,
 );
+
+// The same outcome with a single FILE: once a reload has run while the imported
+// file was missing, the file is out of the watchlist, and only the directory
+// event for its name coming back can bring it (and its watch) back.
+it(
+  "should hot reload when a deleted import is written again after the failed reload",
+  async () => {
+    using hot = hotDirFixture();
+    await hot.next("a0");
+
+    rmSync(join(hot.root, "lib", "dep.js"));
+    await hot.nextStderr(`Cannot find module './lib/dep.js'`);
+    hot.writeDep("lib", "e0");
+    await hot.next("e0");
+
+    await hot.expectLaterSavesReload("e");
+  },
+  timeout,
+);
+
+it(
+  "should hot reload when a deleted import is renamed into place after the failed reload",
+  async () => {
+    using hot = hotDirFixture();
+    await hot.next("a0");
+
+    rmSync(join(hot.root, "lib", "dep.js"));
+    await hot.nextStderr(`Cannot find module './lib/dep.js'`);
+    writeFileSync(join(hot.root, "lib", "dep.js.tmp"), `export const V = "f0";\n`);
+    renameSync(join(hot.root, "lib", "dep.js.tmp"), join(hot.root, "lib", "dep.js"));
+    await hot.next("f0");
+
+    await hot.expectLaterSavesReload("f");
+  },
+  timeout,
+);
+
+it(
+  "should hot reload when an import comes back after its name was briefly a directory",
+  async () => {
+    using hot = hotDirFixture();
+    await hot.next("a0");
+
+    // Some tools park a directory (or a dangling symlink) at the file's name
+    // for a moment while they rewrite it.
+    renameSync(join(hot.root, "lib", "dep.js"), join(hot.root, "lib", "dep.away"));
+    mkdirSync(join(hot.root, "lib", "dep.js"));
+    await hot.nextStderr(`Cannot find module './lib/dep.js'`);
+    rmSync(join(hot.root, "lib", "dep.js"), { recursive: true });
+    writeFileSync(join(hot.root, "lib", "dep.away"), `export const V = "g0";\n`);
+    renameSync(join(hot.root, "lib", "dep.away"), join(hot.root, "lib", "dep.js"));
+    await hot.next("g0");
+
+    await hot.expectLaterSavesReload("g");
+  },
+  timeout,
+);
