@@ -90,6 +90,150 @@ export async function run(cmd: string[]): Promise<string> {
 }
 
 /**
+ * The parallel batch of the shard that hung (build 111536, debian 13 aarch64),
+ * file for file, minus the two napi files whose prebuilds the runner makes.
+ */
+export const HUNG_BATCH = `
+test/bundler/bundler_browser.test.ts
+test/bundler/bundler_loader.test.ts
+test/bundler/css/wpt/color-computed.test.ts
+test/bundler/resolver/cache-node-compat.test.ts
+test/cli/heap-prof.test.ts
+test/cli/install/migration/pnpm-migration-complete.test.ts
+test/cli/run/crash-report-command-char.test.ts
+test/cli/run/scoped-debug-log.test.ts
+test/cli/run/self-reference.test.ts
+test/internal/fifo.test.ts
+test/internal/rust-windows-sys-link.test.ts
+test/js/bun/glob/match.test.ts
+test/js/bun/http/bun-serve-html-manifest.test.ts
+test/js/bun/http/bun-serve-html.test.ts
+test/js/bun/http/bun-serve-ssl.test.ts
+test/js/bun/http/form-data-set-append.test.js
+test/js/bun/perf/linker-order.test.ts
+test/js/bun/resolve/esModule.test.ts
+test/js/bun/resolve/require-esm-evaluating-cycle.test.ts
+test/js/bun/shell/env.positionals.test.ts
+test/js/bun/shell/pipeline_stack.test.ts
+test/js/bun/spawn/spawn.ipc.test.ts
+test/js/bun/symbols.test.ts
+test/js/bun/test/bun_test.test.ts
+test/js/bun/test/fake-timers/sinonjs/fake-timers.test.ts
+test/js/bun/test/fake-timers/sinonjs/issue-276.test.ts
+test/js/bun/test/mock-disposable.test.ts
+test/js/bun/test/mock/6874/B.test.ts
+test/js/bun/test/test-failing.test.ts
+test/js/bun/util/filesink.test.ts
+test/js/bun/util/fuzzy-wuzzy.test.ts
+test/js/bun/util/pathToFileURL-invalid.test.ts
+test/js/bun/webview/webview-chrome-disconnect.test.ts
+test/js/bun/webview/webview.test.ts
+test/js/node/async_hooks/async-local-storage-thenable.test.ts
+test/js/node/crypto/sign-jwk-ieee-p1363.test.ts
+test/js/node/http/node-http-req-socket-pause.test.ts
+test/js/node/http/node-http.compress.leak.test.ts
+test/js/node/stream/node-stream-uint8array.test.ts
+test/js/node/tls/node-tls-duplex-close-throw-uaf.test.ts
+test/js/node/url/url-parse-invalid-input.test.js
+test/js/node/zlib/zlib-estimated-size-gc.test.ts
+test/js/sql/sql-helpers-validation.test.ts
+test/js/sql/sqlite-sql.test.ts
+test/js/third_party/body-parser/express-bun-build-compile.test.ts
+test/js/third_party/express/res.json.test.ts
+test/js/third_party/grpc-js/test-certificate-provider.test.ts
+test/js/third_party/grpc-js/test-local-subchannel-pool.test.ts
+test/js/third_party/grpc-js/test-metadata.test.ts
+test/js/third_party/http2-wrapper/http2-wrapper.test.ts
+test/js/third_party/remix/remix.test.ts
+test/js/third_party/rollup-v4/rollup-v4.test.ts
+test/js/third_party/wpt-h2/run.test.ts
+test/js/web/fetch/headers-case.test.ts
+test/js/web/streams/readable-stream-blob-consumed.test.ts
+test/js/web/streams/transform-stream-leak.test.ts
+test/js/web/websocket/websocket-pause.test.ts
+test/js/web/workers/worker-postmessage-transfer.test.ts
+test/regression/issue/03091.test.ts
+test/regression/issue/05828.test.ts
+test/regression/issue/06946/06946.test.ts
+test/regression/issue/09555.test.ts
+test/regression/issue/17244.test.ts
+test/regression/issue/17405.test.ts
+test/regression/issue/22243.test.ts
+test/regression/issue/23139.test.ts
+test/regression/issue/24234.test.ts
+test/regression/issue/25622.test.ts
+test/regression/issue/25628.test.ts
+test/regression/issue/25716.test.ts
+test/regression/issue/26377.test.ts
+test/regression/issue/28159.test.ts
+test/regression/issue/2993.test.ts
+test/regression/issue/32728.test.ts
+test/regression/issue/css-system-color-mix-crash.test.ts
+test/regression/issue/issue-1825-jest-mock-functions.test.ts
+`
+  .trim()
+  .split("\n");
+
+/**
+ * Runs that batch the way the CI runner does (`--parallel=3`, junit reporter,
+ * dots) until `budgetMs` is spent, and returns how many rounds ran and the
+ * output of any round in which linker-order.test.ts's watchdog fired.
+ */
+export async function runHungBatchRounds(label: string, budgetMs: number): Promise<{ rounds: number; bad: string[] }> {
+  const { bunEnv, bunExe } = await import("harness");
+  const repo = join(import.meta.dir, "../../../..");
+  const junit = join(repo, `probe-junit-${label}-${process.pid}.xml`);
+  const t0 = performance.now();
+  const bad: string[] = [];
+  let rounds = 0;
+  let last = 0;
+  while (performance.now() - t0 + Math.max(last, 12_000) < budgetMs && bad.length < 2) {
+    const started = performance.now();
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "test",
+        "--parallel=3",
+        "--timeout=90000",
+        "--dots",
+        "--reporter=junit",
+        `--reporter-outfile=${junit}`,
+        ...HUNG_BATCH,
+      ],
+      cwd: repo,
+      env: { ...bunEnv, BUN_FUNCTRACE_PROBE: "1" },
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+    });
+    const [stdout, stderr] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    last = performance.now() - started;
+    rounds++;
+    const out = stdout + stderr;
+    const summary = /Ran \d+ tests across \d+ files\. \[[^\]]+\]/.exec(out)?.[0] ?? `exit ${proc.exitCode}`;
+    const steps = out.split("\n").find(line => line.includes("functrace steps:")) ?? "<no steps line>";
+    console.log(`${label} round ${rounds}: ${summary} ${steps.trim()}`);
+    if (
+      /functrace watchdog|STALLED|REPEAT trap|keeps them across an exec'd child/.test(
+        out.replace(/functrace steps:.*$/gm, ""),
+      )
+    ) {
+      bad.push(
+        out
+          .split("\n")
+          .filter(line => !/^[.\s]*$/.test(line))
+          .slice(-600)
+          .join("\n"),
+      );
+    }
+  }
+  try {
+    (await import("node:fs")).rmSync(junit, { force: true });
+  } catch {}
+  return { rounds, bad };
+}
+
+/**
  * The body of linker-order.test.ts's pty-runner case. It runs concurrently with
  * the tracer case in the real file: two more compiles, a bun under a pty and a
  * bun on pipes, in the same worker process at the same moment.

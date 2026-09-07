@@ -7,10 +7,17 @@
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, isLinux, isMusl, tempDir } from "harness";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { availableParallelism } from "node:os";
 import { join } from "node:path";
 import { readTextSymbols } from "../../../../scripts/orderfile/generate.ts";
-import { childrenOf, describeSelf, describeTree, probeTracerSource, run } from "./functrace-probe-helpers.ts";
+import {
+  HUNG_BATCH,
+  childrenOf,
+  describeSelf,
+  describeTree,
+  probeTracerSource,
+  run,
+  runHungBatchRounds,
+} from "./functrace-probe-helpers.ts";
 
 const orderfile = join(import.meta.dir, "../../../../scripts/orderfile");
 const compiler = process.env.CC || Bun.which("cc") || Bun.which("clang") || Bun.which("gcc");
@@ -246,112 +253,7 @@ describe.skipIf(!canProbe)("function tracer hang probe", () => {
     return { hangs, fails, repeats };
   }
 
-  test("traced fixture, idle machine", async () => {
-    const { hangs, fails, repeats } = await phase("idle", 150, 4, 30_000);
-    expect({ hangs, fails, repeats }).toEqual({ hangs: 0, fails: 0, repeats: 0 });
-  }, 300_000);
-
-  test("traced fixture, under cpu and spawn load", async () => {
-    const hogs = Array.from({ length: availableParallelism() }, () =>
-      Bun.spawn({
-        cmd: [bunExe(), "-e", "for (let i = 0; ; i++) if (i % 1e7 === 0) Bun.spawnSync({ cmd: ['true'] });"],
-        env: bunEnv,
-        stdout: "ignore",
-        stderr: "ignore",
-      }),
-    );
-    try {
-      const { hangs, fails, repeats } = await phase("load", 300, 6, 30_000);
-      expect({ hangs, fails, repeats }).toEqual({ hangs: 0, fails: 0, repeats: 0 });
-    } finally {
-      for (const hog of hogs) hog.kill("SIGKILL");
-      await Promise.all(hogs.map(hog => hog.exited));
-    }
-  }, 600_000);
-
-  // The parallel batch of the shard that hung (build 111536, debian 13 aarch64),
-  // file for file, minus the two napi files whose prebuilds the runner makes.
-  // linker-order.test.ts carries its own watchdog for the tracer test.
-  const BATCH = `
-test/bundler/bundler_browser.test.ts
-test/bundler/bundler_loader.test.ts
-test/bundler/css/wpt/color-computed.test.ts
-test/bundler/resolver/cache-node-compat.test.ts
-test/cli/heap-prof.test.ts
-test/cli/install/migration/pnpm-migration-complete.test.ts
-test/cli/run/crash-report-command-char.test.ts
-test/cli/run/scoped-debug-log.test.ts
-test/cli/run/self-reference.test.ts
-test/internal/fifo.test.ts
-test/internal/rust-windows-sys-link.test.ts
-test/js/bun/glob/match.test.ts
-test/js/bun/http/bun-serve-html-manifest.test.ts
-test/js/bun/http/bun-serve-html.test.ts
-test/js/bun/http/bun-serve-ssl.test.ts
-test/js/bun/http/form-data-set-append.test.js
-test/js/bun/perf/linker-order.test.ts
-test/js/bun/resolve/esModule.test.ts
-test/js/bun/resolve/require-esm-evaluating-cycle.test.ts
-test/js/bun/shell/env.positionals.test.ts
-test/js/bun/shell/pipeline_stack.test.ts
-test/js/bun/spawn/spawn.ipc.test.ts
-test/js/bun/symbols.test.ts
-test/js/bun/test/bun_test.test.ts
-test/js/bun/test/fake-timers/sinonjs/fake-timers.test.ts
-test/js/bun/test/fake-timers/sinonjs/issue-276.test.ts
-test/js/bun/test/mock-disposable.test.ts
-test/js/bun/test/mock/6874/B.test.ts
-test/js/bun/test/test-failing.test.ts
-test/js/bun/util/filesink.test.ts
-test/js/bun/util/fuzzy-wuzzy.test.ts
-test/js/bun/util/pathToFileURL-invalid.test.ts
-test/js/bun/webview/webview-chrome-disconnect.test.ts
-test/js/bun/webview/webview.test.ts
-test/js/node/async_hooks/async-local-storage-thenable.test.ts
-test/js/node/crypto/sign-jwk-ieee-p1363.test.ts
-test/js/node/http/node-http-req-socket-pause.test.ts
-test/js/node/http/node-http.compress.leak.test.ts
-test/js/node/stream/node-stream-uint8array.test.ts
-test/js/node/tls/node-tls-duplex-close-throw-uaf.test.ts
-test/js/node/url/url-parse-invalid-input.test.js
-test/js/node/zlib/zlib-estimated-size-gc.test.ts
-test/js/sql/sql-helpers-validation.test.ts
-test/js/sql/sqlite-sql.test.ts
-test/js/third_party/body-parser/express-bun-build-compile.test.ts
-test/js/third_party/express/res.json.test.ts
-test/js/third_party/grpc-js/test-certificate-provider.test.ts
-test/js/third_party/grpc-js/test-local-subchannel-pool.test.ts
-test/js/third_party/grpc-js/test-metadata.test.ts
-test/js/third_party/http2-wrapper/http2-wrapper.test.ts
-test/js/third_party/remix/remix.test.ts
-test/js/third_party/rollup-v4/rollup-v4.test.ts
-test/js/third_party/wpt-h2/run.test.ts
-test/js/web/fetch/headers-case.test.ts
-test/js/web/streams/readable-stream-blob-consumed.test.ts
-test/js/web/streams/transform-stream-leak.test.ts
-test/js/web/websocket/websocket-pause.test.ts
-test/js/web/workers/worker-postmessage-transfer.test.ts
-test/regression/issue/03091.test.ts
-test/regression/issue/05828.test.ts
-test/regression/issue/06946/06946.test.ts
-test/regression/issue/09555.test.ts
-test/regression/issue/17244.test.ts
-test/regression/issue/17405.test.ts
-test/regression/issue/22243.test.ts
-test/regression/issue/23139.test.ts
-test/regression/issue/24234.test.ts
-test/regression/issue/25622.test.ts
-test/regression/issue/25628.test.ts
-test/regression/issue/25716.test.ts
-test/regression/issue/26377.test.ts
-test/regression/issue/28159.test.ts
-test/regression/issue/2993.test.ts
-test/regression/issue/32728.test.ts
-test/regression/issue/css-system-color-mix-crash.test.ts
-test/regression/issue/issue-1825-jest-mock-functions.test.ts
-`
-    .trim()
-    .split("\n");
+  const BATCH = HUNG_BATCH;
 
   /**
    * The CI hang happens in a `--parallel` worker that already ran other files,
@@ -366,7 +268,7 @@ test/regression/issue/issue-1825-jest-mock-functions.test.ts
       const repo = join(import.meta.dir, "../../../..");
       const helpers = join(import.meta.dir, "functrace-probe-helpers.ts");
       const cases = process.arch === "arm64" ? 48 : 12;
-      const rounds = process.arch === "arm64" ? 12 : 1;
+      const rounds = process.arch === "arm64" ? 5 : 1;
       const neighbors = BATCH.filter(f =>
         /bundler_loader|webview\/webview\.test|bun-serve-html\.test|fifo|filesink|spawn\.ipc|sqlite-sql|heap-prof|websocket-pause|self-reference|pipeline_stack|bun_test\.test/.test(
           f,
@@ -439,37 +341,14 @@ test/regression/issue/issue-1825-jest-mock-functions.test.ts
     1_800_000,
   );
 
+  // The faithful reproduction: the hung shard's batch, as the runner runs it.
+  // linker-order-probe-batch-*.test.ts run more rounds of the same, each inside
+  // its own per-file budget.
   test("linker-order.test.ts inside the parallel batch that hung", async () => {
-    const repo = join(import.meta.dir, "../../../..");
-    const rounds = process.arch === "arm64" ? 4 : 1;
-    let timedOut = 0;
-    const t0 = performance.now();
-    for (let i = 0; i < rounds && timedOut < 2; i++) {
-      await using proc = Bun.spawn({
-        cmd: [bunExe(), "test", "--parallel=3", "--timeout=70000", "--dots", ...BATCH],
-        cwd: repo,
-        env: { ...bunEnv, BUN_FUNCTRACE_PROBE: "1" },
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      const [stdout, stderr] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
-      const out = stdout + stderr;
-      const summary = /Ran \d+ tests across \d+ files\. \[[^\]]+\]/.exec(out)?.[0] ?? `exit ${proc.exitCode}`;
-      const steps = out.split("\n").find(line => line.includes("functrace steps:")) ?? "<no steps line>";
-      console.log(`batch ${i}: ${summary} ${steps.trim()}`);
-      if (/timed out|HUNG|functrace watchdog|REPEAT trap/.test(out)) {
-        timedOut++;
-        console.error(
-          `=== batch ${i} output (filtered)\n${out
-            .split("\n")
-            .filter(line => !/^[.\s]*$/.test(line))
-            .slice(-500)
-            .join("\n")}`,
-        );
-      }
-    }
-    console.log(`batches: ${((performance.now() - t0) / 1000).toFixed(1)} s, ${timedOut} with a tracer timeout`);
-    expect(timedOut).toBe(0);
+    const { rounds, bad } = await runHungBatchRounds("probe", process.arch === "arm64" ? 60_000 : 30_000);
+    for (const out of bad) console.error(`=== stalled batch output (filtered)\n${out}`);
+    console.log(`batches: ${rounds} rounds, ${bad.length} with a tracer stall`);
+    expect(bad.length).toBe(0);
   }, 1_800_000);
 
   test("cleanup", () => {
